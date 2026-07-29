@@ -202,7 +202,10 @@ startup. These variables exist for overriding that:
 | `K3_DEV` | auto | `mps` when available, then `cuda`, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
 | `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
 | `K3_EXPERT_SOURCE` | `cache-http` | `direct-shards` reads routed experts with positional I/O from an unmodified local official checkpoint; see [the M3 Ultra direct-shard report](docs/m3ultra512-direct-shards.md) |
-| `K3_RESIDENT_SOURCE` | `cache-http` | `direct-shards` reads non-routed tensors from the same unmodified checkpoint; the M3 Ultra profile pairs this with `K3_SPINE=bf16` |
+| `K3_RESIDENT_SOURCE` | `cache-http` | `direct-shards` reads non-routed tensors from the same unmodified checkpoint; see the [complete MPS resident report](docs/m3ultra512-m1d-resident.md) |
+| `K3_RESIDENT_BANK` | `0` | materialize the complete direct-shard resident inventory once and alias streamed layer parameters to that MPS storage; enabled by the 512 GB profile |
+| `K3_PREAD_NOCACHE` | `0` | normal direct-shard runtime uses buffered positional I/O and macOS page cache; `1` is a measurement control and does not purge pages already in RAM |
+| `K3_DIRECT_SLAB` | `0` | lease one of two reusable page-aligned 16-expert banks through synchronous CPU/Metal MoE compute; enabled by the M3 Ultra profile |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |

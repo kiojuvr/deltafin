@@ -99,7 +99,9 @@ ignored by Git.
 The retained run uses a shard not touched by the standard-reader comparison.
 Single-expert figures use ordinary buffered `pread`; 16-expert storage figures
 use Darwin `F_NOCACHE` on the shared shard descriptor. No privileged global
-cache purge was performed, so “first” is explicitly a cold candidate.
+cache purge was performed. `F_NOCACHE` does not evict pages that are already
+resident, so every figure below is process-observed bandwidth, not automatically
+physical storage bandwidth.
 
 | Measurement | Result | Effective bandwidth |
 |---|---:|---:|
@@ -110,17 +112,21 @@ cache purge was performed, so “first” is explicitly a cold candidate.
 | Single expert, immediate second read | 1.45 ms | 12.08 GB/s |
 | Same expert, repeated median | 1.25 ms | 14.07 GB/s |
 | 16 experts, sequential `F_NOCACHE` | 323 ms | 0.868 GB/s |
-| 16 experts, 8-way parallel `F_NOCACHE` | 40.8 ms | 6.89 GB/s |
+| 16 experts, 8-way parallel `F_NOCACHE` (cache-affected) | 40.8 ms | 6.89 GB/s |
 
 The immediate second read was 14.8 times faster than the first candidate,
 demonstrating why buffered and physical-read measurements must not be mixed.
+The two 5 Gbit/s USB members cap the RAID at roughly 1.25 GB/s before protocol
+overhead. Consequently 6.89 GB/s cannot be physical SSD throughput. The
+sequential 0.868 GB/s result is physically plausible; the parallel result
+demonstrates fast page-cache-to-buffer delivery.
 
 ## Current bottleneck and next phase
 
-The direct storage path reaches 6.89 GB/s with eight positional reads, while a
-single sequential stream reaches only 0.868 GB/s. Physical I/O parallelism is
-therefore still essential. Warm page-cache reads are much faster, but the
-1.45 TB expert set cannot be treated as resident even on a 512 GB machine.
+When pages are resident, eight positional reads deliver 6.89 GB/s to the
+process, while the storage-compatible sequential result is 0.868 GB/s. The
+1.45 TB expert set cannot be wholly resident even on a 512 GB machine, so
+runtime performance depends on routing locality and the macOS file cache.
 The M1 follow-up now provides partial resident reads, one-real-layer bitwise
 parity, and recyclable page-aligned double expert slabs. See the
 [M1 layer-parity report](m3ultra512-m1-layer-parity.md) for the implementation,
@@ -128,11 +134,9 @@ measurements, zero-copy counters, and CPU/Metal output comparison.
 
 The next implementation sequence should be:
 
-1. Extend the verified one-layer ownership model to the complete resident
-   spine while measuring unified, wired, compressor, and file-cache memory.
-2. Route the double slab through the ordinary inference runtime while
-   preserving the zero-copy counter assertions.
-3. Assemble one-token inference with profiling enabled, first serially for
+1. Assemble one-token inference with the now-validated
+   [complete resident bank](m3ultra512-m1d-resident.md) and runtime double slab,
+   first serially for
    correctness and then with next-layer read overlap. Keep HTTP/cache as an A/B
    oracle until token/logit parity is established.
 

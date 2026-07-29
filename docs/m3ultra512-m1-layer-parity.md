@@ -91,8 +91,9 @@ relative error zero.
 ## Retained measurements
 
 These values are a correctness-run snapshot, not a cold-storage benchmark.
-Earlier validation and each stage can warm different pages, so the M0
-`F_NOCACHE` measurements remain the physical-I/O reference.
+Earlier validation and each stage can warm different pages. `F_NOCACHE` does
+not purge already resident pages, so the 21–27 GB/s slab figures below describe
+RAM/page-cache delivery and must not be interpreted as USB RAID throughput.
 
 | Measurement | Result |
 |---|---:|
@@ -155,9 +156,7 @@ synchronization separately.
 
 The next sequence is:
 
-1. Extend the verified one-layer ownership model to the complete resident
-   spine while recording allocated, wired, compressor, and file-cache memory.
-2. Feed the double slab through the ordinary routed-layer runtime rather than
-   only the focused validator, preserving the zero-copy counter assertion.
-3. Build a serial one-token run first, retain stage-level parity and timing,
+1. Use the validated
+   [complete resident bank and runtime slab](m3ultra512-m1d-resident.md).
+2. Build a serial one-token run first, retain stage-level parity and timing,
    then enable next-layer overlap.
