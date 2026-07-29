@@ -752,6 +752,25 @@ if RESIDENT_SOURCE == "direct-shards":
     k3loader.load_resident = resident_shard_loader.load_resident
     print(f"[config] resident source: direct official shards "
           f"({direct_shard_loader.MODEL_DIR})", flush=True)
+    if os.environ.get("K3_RESIDENT_BANK", "0") == "1":
+        if DEV.type != "mps":
+            raise RuntimeError("K3_RESIDENT_BANK=1 requires K3_DEV=mps")
+
+        def _resident_bank_progress(index, total, label, bank, report):
+            print(
+                f"[resident-bank {index:02d}/{total:02d}] {label}: "
+                f"{len(bank)} tensors, "
+                f"{bank.materialized_bytes / 1e9:.1f} GB MPS, "
+                f"{report.total_seconds:.2f}s",
+                flush=True,
+            )
+
+        resident_shard_loader.build_runtime_bank(
+            device=DEV,
+            dtype=DT,
+            layers_per_stage=8,
+            progress=_resident_bank_progress,
+        )
 elif RESIDENT_SOURCE != "cache-http":
     raise ValueError(
         "K3_RESIDENT_SOURCE must be cache-http or direct-shards, "
@@ -787,6 +806,13 @@ if grouped_moe.enabled():
 
 _LAST_SEL = {}   # layer -> ids selected for the most recent token (prefetch oracle)
 _PREV_SEL = {}   # snapshot of _LAST_SEL taken when the current pass started
+DIRECT_SLAB_ACTIVE = (
+    EXPERT_SOURCE == "direct-shards"
+    and FAST_MOE
+    and direct_shard_loader.slab_enabled()
+)
+if DIRECT_SLAB_ACTIVE:
+    print("[config] direct expert source: reusable 16x2 aligned slabs", flush=True)
 
 
 def prefetch_prev_token():
@@ -825,6 +851,18 @@ def _issue_next_expert_prefetch(li):
             fetch_v2.prefetch_layer(li + 1, nxt)
 
 
+def _invoke_fast_moe(x, topk_ids, topk_weight, raw, routing_record):
+    if routing_record is None:
+        return _MOE_FN(x, topk_ids, topk_weight, raw)
+    return _MOE_FN(
+        x,
+        topk_ids,
+        topk_weight,
+        raw,
+        routing_record=routing_record,
+    )
+
+
 def moe_infer_lazy(self, x, topk_ids, topk_weight):
     li = _step_ctx["layer"]
     rows = topk_ids.tolist()                    # [positions][top_k]
@@ -853,6 +891,27 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
             TRACE.record(_step_ctx["step"], li, flat,
                          routing_record["weights"])
             return out
+    if DIRECT_SLAB_ACTIVE and len(ids) <= 16:
+        t0 = time.time()
+        with direct_shard_loader.slab_experts(li, ids) as raw:
+            TIMES["expert_fetch"] += time.time() - t0
+            _issue_next_expert_prefetch(li)
+            TRACE.record(
+                _step_ctx["step"],
+                li,
+                flat,
+                (
+                    routing_record["weights"]
+                    if routing_record
+                    else topk_weight
+                ),
+            )
+            tk = time.time()
+            out = _invoke_fast_moe(
+                x, topk_ids, topk_weight, raw, routing_record
+            )
+            TIMES["moe_kernel"] += time.time() - tk
+            return out
     t0 = time.time()
     raw = k3loader.fetch_experts(li, ids, dequant=not FAST_MOE)
     TIMES["expert_fetch"] += time.time() - t0
@@ -864,12 +923,9 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
                  routing_record["weights"] if routing_record else topk_weight)
     if FAST_MOE:
         tk = time.time()
-        if routing_record is None:
-            out = _MOE_FN(x, topk_ids, topk_weight, raw)
-        else:
-            out = _MOE_FN(
-                x, topk_ids, topk_weight, raw,
-                routing_record=routing_record)
+        out = _invoke_fast_moe(
+            x, topk_ids, topk_weight, raw, routing_record
+        )
         TIMES["moe_kernel"] += time.time() - tk
         return out
     for e, w in raw.items():
@@ -933,7 +989,16 @@ class LazyEmbed:
         self.meta = k3loader.INV[self.NAME]
         self.rowbytes = H * 2
         self._fd = None
-        self._ensure_fd()
+        self._resident = (
+            resident_shard_loader.runtime_bank().tensor(self.NAME)
+            if (
+                RESIDENT_SOURCE == "direct-shards"
+                and resident_shard_loader.runtime_bank() is not None
+            )
+            else None
+        )
+        if self._resident is None:
+            self._ensure_fd()
 
     def _ensure_fd(self):
         if self._fd is None:
@@ -991,6 +1056,9 @@ class LazyEmbed:
 
     def __call__(self, ids):
         tids = [int(t) for t in ids]
+        if self._resident is not None:
+            index = torch.tensor(tids, dtype=torch.int64, device=DEV)
+            return self._resident.index_select(0, index).unsqueeze(0)
         buf = (self._local_rows(tids) if self._ensure_fd() is not None
                else b"".join(self._row(tid) for tid in tids))
         t = torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(len(tids), H)

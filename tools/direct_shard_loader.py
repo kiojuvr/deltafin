@@ -9,9 +9,10 @@ existing CPU and Metal MoE paths.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import pathlib
-import sys
+import queue
 import threading
 import time
 
@@ -25,8 +26,9 @@ _MODEL_DIR_TEXT = os.environ.get("K3_MODEL_DIR")
 MODEL_DIR = pathlib.Path(_MODEL_DIR_TEXT) if _MODEL_DIR_TEXT else None
 SIDECAR = os.environ.get("K3_DIRECT_SHARDS_SIDECAR")
 WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
+DIRECT_SLAB = os.environ.get("K3_DIRECT_SLAB", "0") == "1"
 DARWIN_NOCACHE = os.environ.get(
-    "K3_PREAD_NOCACHE", "1" if sys.platform == "darwin" else "0"
+    "K3_PREAD_NOCACHE", "0"
 ) == "1"
 
 stats = {
@@ -37,10 +39,16 @@ stats = {
     "pread_experts": 0,
     "pread_bytes": 0,
     "pread_s": 0.0,
+    "slab_loads": 0,
+    "slab_bytes": 0,
+    "slab_s": 0.0,
 }
 _stats_lock = threading.Lock()
 _store_lock = threading.Lock()
 _store: LocalSafetensorsStore | None = None
+_slab_lock = threading.Lock()
+_slabs = None
+_slab_available: queue.Queue[int] | None = None
 
 
 def store() -> LocalSafetensorsStore:
@@ -75,6 +83,60 @@ def _compatible(
         }
         for expert, values in tensors.items()
     }
+
+
+def slab_enabled() -> bool:
+    return DIRECT_SLAB
+
+
+def _slab_pool():
+    global _slabs, _slab_available
+    if _slabs is not None:
+        return _slabs, _slab_available
+    with _slab_lock:
+        if _slabs is None:
+            from expert_slab import DoubleExpertSlab
+
+            _slabs = DoubleExpertSlab(store())
+            _slab_available = queue.Queue(maxsize=2)
+            _slab_available.put(0)
+            _slab_available.put(1)
+    return _slabs, _slab_available
+
+
+@contextlib.contextmanager
+def slab_experts(layer: int, eids, workers: int | None = None):
+    """Lease one fixed slab bank through the caller's synchronous MoE compute."""
+    ids = tuple(int(expert) for expert in eids)
+    if not DIRECT_SLAB:
+        raise RuntimeError("K3_DIRECT_SLAB is disabled")
+    if len(ids) > 16:
+        raise ValueError(f"direct slab holds 16 experts, got {len(ids)}")
+    slabs, available = _slab_pool()
+    bank_index = available.get()
+    raw = None
+    try:
+        started = time.perf_counter()
+        raw = slabs.banks[bank_index].load(
+            layer, ids, workers=workers or WORKERS
+        )
+        elapsed = time.perf_counter() - started
+        byte_count = sum(
+            store().expert_layout(layer, expert).byte_length
+            for expert in ids
+        )
+        with _stats_lock:
+            stats["expert_disk"] += len(ids)
+            stats["pread_experts"] += len(ids)
+            stats["pread_bytes"] += byte_count
+            stats["pread_s"] += elapsed
+            stats["slab_loads"] += 1
+            stats["slab_bytes"] += byte_count
+            stats["slab_s"] += elapsed
+        yield raw
+    finally:
+        raw = None
+        available.put(bank_index)
 
 
 def fetch_expert_raw(
@@ -129,7 +191,12 @@ def fetch_experts(
 
 
 def close() -> None:
-    global _store
+    global _store, _slabs, _slab_available
+    with _slab_lock:
+        slabs, _slabs = _slabs, None
+        _slab_available = None
+    if slabs is not None:
+        slabs.close()
     with _store_lock:
         local_store, _store = _store, None
     if local_store is not None:

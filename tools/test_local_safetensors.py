@@ -6,10 +6,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import queue
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from safetensors import safe_open
@@ -22,7 +24,12 @@ from local_safetensors import (  # noqa: E402
     UnknownTensorError,
 )
 import direct_shard_loader  # noqa: E402
-from resident_shard_loader import DirectResidentLoader  # noqa: E402
+import local_safetensors  # noqa: E402
+import resident_shard_loader  # noqa: E402
+from resident_shard_loader import (  # noqa: E402
+    DirectResidentLoader,
+    ResidentTensorBank,
+)
 
 
 PREFIX = "language_model.model.layers"
@@ -186,6 +193,18 @@ class LocalSafetensorsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             store.read_tensor(self.names["a"])
 
+    def test_positional_reads_chunk_large_requests(self):
+        with LocalSafetensorsStore(self.root) as store:
+            with mock.patch.object(local_safetensors, "_PREAD_CHUNK", 3):
+                payload = store.read_tensor_bytes("resident.matrix")
+                expected = np.arange(
+                    12, dtype=np.float32
+                ).reshape(3, 4).tobytes()
+                self.assertEqual(payload, expected)
+                destination = bytearray(len(expected))
+                store.read_tensor_into("resident.matrix", destination)
+                self.assertEqual(bytes(destination), expected)
+
     def test_sidecar_round_trip_and_fingerprint(self):
         sidecar = self.root / "index.json.gz"
         with LocalSafetensorsStore(self.root) as original:
@@ -231,6 +250,95 @@ class LocalSafetensorsTests(unittest.TestCase):
                 loader.read_rows_torch("resident.matrix", [3])
             with self.assertRaisesRegex(ValueError, "routed-expert"):
                 loader.read_bytes(self.names["a"])
+
+    def test_resident_tensor_bank_owns_only_materialized_tensors(self):
+        import torch
+
+        with LocalSafetensorsStore(self.root) as store:
+            loader = DirectResidentLoader(store)
+            bank = ResidentTensorBank(
+                loader, device="cpu", dtype=torch.float32
+            )
+            report = bank.load_names(
+                ["resident.scalar", "resident.matrix"]
+            )
+            self.assertEqual(report.tensors, 2)
+            self.assertEqual(len(bank), 2)
+            self.assertEqual(bank.tensor("resident.matrix").shape, (3, 4))
+            self.assertEqual(bank.materialized_bytes, 13 * 4)
+            with self.assertRaisesRegex(ValueError, "already loaded"):
+                bank.load_names(["resident.scalar"])
+            with self.assertRaisesRegex(KeyError, "is not loaded"):
+                bank.tensor("resident.missing")
+            self.assertEqual(bank.release(), (2, 13 * 4))
+            self.assertEqual(len(bank), 0)
+
+    def test_runtime_resident_bank_reuses_device_storage(self):
+        import torch
+
+        resident_shard_loader.release_runtime_bank()
+        old_loader = resident_shard_loader._loader
+        with LocalSafetensorsStore(self.root) as store:
+            loader = DirectResidentLoader(store)
+            resident_shard_loader._loader = loader
+            try:
+                stages = loader.resident_stages(layers_per_stage=8)
+                self.assertEqual(stages[0][0], "global")
+                bank = resident_shard_loader.build_runtime_bank(
+                    device="cpu", dtype=torch.float32
+                )
+                tensor = resident_shard_loader.load_resident(
+                    "resident.matrix"
+                )
+                self.assertEqual(
+                    tensor.data_ptr(),
+                    bank.tensor("resident.matrix").data_ptr(),
+                )
+            finally:
+                resident_shard_loader.release_runtime_bank()
+                resident_shard_loader._loader = old_loader
+
+    def test_slab_adapter_holds_bank_lease_through_context(self):
+        class FakeBank:
+            def __init__(self, value):
+                self.value = value
+
+            def load(self, layer, ids, workers):
+                return {
+                    "bank": self.value,
+                    "layer": layer,
+                    "ids": tuple(ids),
+                    "workers": workers,
+                }
+
+        class FakeSlabs:
+            banks = (FakeBank("a"), FakeBank("b"))
+
+            def close(self):
+                pass
+
+        direct_shard_loader.close()
+        direct_shard_loader._store = LocalSafetensorsStore(self.root)
+        direct_shard_loader._slabs = FakeSlabs()
+        direct_shard_loader._slab_available = queue.Queue(maxsize=2)
+        direct_shard_loader._slab_available.put(0)
+        direct_shard_loader._slab_available.put(1)
+        old_enabled = direct_shard_loader.DIRECT_SLAB
+        direct_shard_loader.DIRECT_SLAB = True
+        try:
+            with direct_shard_loader.slab_experts(
+                1, [0], workers=1
+            ) as raw:
+                self.assertEqual(raw["bank"], "a")
+                self.assertEqual(
+                    direct_shard_loader._slab_available.qsize(), 1
+                )
+            self.assertEqual(
+                direct_shard_loader._slab_available.qsize(), 2
+            )
+        finally:
+            direct_shard_loader.DIRECT_SLAB = old_enabled
+            direct_shard_loader.close()
 
 
 if __name__ == "__main__":

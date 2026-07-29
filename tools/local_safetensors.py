@@ -36,6 +36,7 @@ import numpy as np
 INDEX_NAME = "model.safetensors.index.json"
 SIDECAR_SCHEMA = "deltafin.local-safetensors-index.v1"
 _HEADER_LIMIT = 1 << 30
+_PREAD_CHUNK = 256 * 1024 * 1024
 _DARWIN_F_NOCACHE = 48
 _EXPERT_RE = re.compile(
     r"^language_model\.model\.layers\.(\d+)\.block_sparse_moe"
@@ -173,7 +174,7 @@ def _pread_exact(fd: int, length: int, offset: int, label: str) -> bytes:
     remaining = length
     position = offset
     while remaining:
-        chunk = os.pread(fd, remaining, position)
+        chunk = os.pread(fd, min(remaining, _PREAD_CHUNK), position)
         if not chunk:
             got = length - remaining
             raise IOError(f"short pread for {label}: {got}/{length} bytes")
@@ -190,7 +191,8 @@ def _preadv_exact(fd: int, target: memoryview, offset: int, label: str) -> int:
     target = target.cast("B")
     done = 0
     while done < target.nbytes:
-        count = os.preadv(fd, [target[done:]], offset + done)
+        end = min(target.nbytes, done + _PREAD_CHUNK)
+        count = os.preadv(fd, [target[done:end]], offset + done)
         if count <= 0:
             raise IOError(
                 f"short preadv for {label}: {done}/{target.nbytes} bytes"
