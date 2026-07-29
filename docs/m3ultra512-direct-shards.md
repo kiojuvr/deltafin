@@ -121,23 +121,18 @@ The direct storage path reaches 6.89 GB/s with eight positional reads, while a
 single sequential stream reaches only 0.868 GB/s. Physical I/O parallelism is
 therefore still essential. Warm page-cache reads are much faster, but the
 1.45 TB expert set cannot be treated as resident even on a 512 GB machine.
-The correctness-first reader also returns Python-owned byte buffers. They are
-contiguous but not guaranteed to be page-aligned or reusable, so the current
-Metal wrapper may take its safe scratch-copy path. Recyclable, page-aligned
-expert slabs are a runtime optimization for the next phase, not part of the
-validated on-disk index.
+The M1 follow-up now provides partial resident reads, one-real-layer bitwise
+parity, and recyclable page-aligned double expert slabs. See the
+[M1 layer-parity report](m3ultra512-m1-layer-parity.md) for the implementation,
+measurements, zero-copy counters, and CPU/Metal output comparison.
 
 The next implementation sequence should be:
 
-1. Build a read-only resident-spine loader over the same official inventory,
-   preserving BF16 and without creating `k3-resident`.
-2. Allocate the M3 Ultra memory budget explicitly: resident spine, recurrent
-   KDA state, reusable 16-expert double buffers, Metal arenas, and OS headroom.
-3. Feed `direct_shard_loader` buffers into the existing MXFP4 CPU and Metal MoE
-   paths and validate one real routed layer against the current cache path.
-4. Validate every resident tensor against `safetensors.safe_open`, then execute
-   a single layer with recorded router IDs.
-5. Assemble one-token inference with profiling enabled, first serially for
+1. Extend the verified one-layer ownership model to the complete resident
+   spine while measuring unified, wired, compressor, and file-cache memory.
+2. Route the double slab through the ordinary inference runtime while
+   preserving the zero-copy counter assertions.
+3. Assemble one-token inference with profiling enabled, first serially for
    correctness and then with next-layer read overlap. Keep HTTP/cache as an A/B
    oracle until token/logit parity is established.
 
