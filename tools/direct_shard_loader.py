@@ -9,6 +9,7 @@ existing CPU and Metal MoE paths.
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import contextlib
 import os
 import pathlib
@@ -27,6 +28,7 @@ MODEL_DIR = pathlib.Path(_MODEL_DIR_TEXT) if _MODEL_DIR_TEXT else None
 SIDECAR = os.environ.get("K3_DIRECT_SHARDS_SIDECAR")
 WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
 DIRECT_SLAB = os.environ.get("K3_DIRECT_SLAB", "0") == "1"
+DIRECT_OVERLAP = os.environ.get("K3_DIRECT_OVERLAP", "0") == "1"
 DARWIN_NOCACHE = os.environ.get(
     "K3_PREAD_NOCACHE", "0"
 ) == "1"
@@ -42,6 +44,16 @@ stats = {
     "slab_loads": 0,
     "slab_bytes": 0,
     "slab_s": 0.0,
+    "overlap_prefetches": 0,
+    "overlap_prefetch_skipped": 0,
+    "overlap_prefetch_experts": 0,
+    "overlap_prefetch_bytes": 0,
+    "overlap_prefetch_s": 0.0,
+    "overlap_wait_s": 0.0,
+    "overlap_layers": 0,
+    "overlap_hits": 0,
+    "overlap_misses": 0,
+    "overlap_miss_s": 0.0,
 }
 _stats_lock = threading.Lock()
 _store_lock = threading.Lock()
@@ -49,6 +61,8 @@ _store: LocalSafetensorsStore | None = None
 _slab_lock = threading.Lock()
 _slabs = None
 _slab_available: queue.Queue[int] | None = None
+_slab_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_slab_pending = {}
 
 
 def store() -> LocalSafetensorsStore:
@@ -89,8 +103,12 @@ def slab_enabled() -> bool:
     return DIRECT_SLAB
 
 
+def overlap_enabled() -> bool:
+    return DIRECT_SLAB and DIRECT_OVERLAP
+
+
 def _slab_pool():
-    global _slabs, _slab_available
+    global _slabs, _slab_available, _slab_executor
     if _slabs is not None:
         return _slabs, _slab_available
     with _slab_lock:
@@ -101,7 +119,104 @@ def _slab_pool():
             _slab_available = queue.Queue(maxsize=2)
             _slab_available.put(0)
             _slab_available.put(1)
+            _slab_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="k3-direct-overlap"
+            )
     return _slabs, _slab_available
+
+
+def _read_bytes(layer: int, ids) -> int:
+    return sum(
+        store().expert_layout(layer, expert).byte_length
+        for expert in ids
+    )
+
+
+def _record_slab_read(
+    layer: int, ids, elapsed: float, *, prefetch: bool
+) -> None:
+    ids = tuple(ids)
+    if not ids:
+        return
+    byte_count = _read_bytes(layer, ids)
+    with _stats_lock:
+        stats["expert_disk"] += len(ids)
+        stats["pread_experts"] += len(ids)
+        stats["pread_bytes"] += byte_count
+        stats["pread_s"] += elapsed
+        stats["slab_loads"] += 1
+        stats["slab_bytes"] += byte_count
+        stats["slab_s"] += elapsed
+        if prefetch:
+            stats["overlap_prefetches"] += 1
+            stats["overlap_prefetch_experts"] += len(ids)
+            stats["overlap_prefetch_bytes"] += byte_count
+            stats["overlap_prefetch_s"] += elapsed
+
+
+def begin_slab_pass() -> None:
+    """Start a token pass with no stale speculative bank ownership."""
+    settle_slab_prefetches()
+
+
+def prefetch_slab(layer: int, eids, workers: int | None = None) -> bool:
+    """Fill one free bank asynchronously for a predicted next-layer route."""
+    ids = tuple(int(expert) for expert in eids)
+    if not overlap_enabled() or not ids:
+        return False
+    if len(ids) > 16:
+        raise ValueError(f"direct slab holds 16 experts, got {len(ids)}")
+    slabs, available = _slab_pool()
+    with _slab_lock:
+        if layer in _slab_pending:
+            return False
+        try:
+            bank_index = available.get_nowait()
+        except queue.Empty:
+            with _stats_lock:
+                stats["overlap_prefetch_skipped"] += 1
+            return False
+
+        def fill():
+            started = time.perf_counter()
+            raw = slabs.banks[bank_index].load(
+                layer, ids, workers=workers or WORKERS
+            )
+            elapsed = time.perf_counter() - started
+            _record_slab_read(layer, ids, elapsed, prefetch=True)
+            return raw
+
+        try:
+            future = _slab_executor.submit(fill)
+        except BaseException:
+            available.put(bank_index)
+            raise
+        _slab_pending[layer] = {
+            "bank_index": bank_index,
+            "ids": ids,
+            "future": future,
+        }
+    return True
+
+
+def settle_slab_prefetches(*, raise_errors: bool = True) -> None:
+    """Wait out and release any unconsumed speculative banks."""
+    with _slab_lock:
+        pending = list(_slab_pending.values())
+        _slab_pending.clear()
+        available = _slab_available
+    failure = None
+    for ticket in pending:
+        try:
+            ticket["future"].result()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        finally:
+            if available is not None:
+                available.put(ticket["bank_index"])
+    if failure is not None and raise_errors:
+        raise failure
 
 
 @contextlib.contextmanager
@@ -113,26 +228,38 @@ def slab_experts(layer: int, eids, workers: int | None = None):
     if len(ids) > 16:
         raise ValueError(f"direct slab holds 16 experts, got {len(ids)}")
     slabs, available = _slab_pool()
-    bank_index = available.get()
+    with _slab_lock:
+        ticket = _slab_pending.pop(layer, None)
+    bank_index = (
+        ticket["bank_index"] if ticket is not None else available.get()
+    )
     raw = None
     try:
-        started = time.perf_counter()
-        raw = slabs.banks[bank_index].load(
-            layer, ids, workers=workers or WORKERS
-        )
-        elapsed = time.perf_counter() - started
-        byte_count = sum(
-            store().expert_layout(layer, expert).byte_length
-            for expert in ids
-        )
-        with _stats_lock:
-            stats["expert_disk"] += len(ids)
-            stats["pread_experts"] += len(ids)
-            stats["pread_bytes"] += byte_count
-            stats["pread_s"] += elapsed
-            stats["slab_loads"] += 1
-            stats["slab_bytes"] += byte_count
-            stats["slab_s"] += elapsed
+        bank = slabs.banks[bank_index]
+        if ticket is None:
+            started = time.perf_counter()
+            raw = bank.load(layer, ids, workers=workers or WORKERS)
+            elapsed = time.perf_counter() - started
+            _record_slab_read(layer, ids, elapsed, prefetch=False)
+        else:
+            waited = time.perf_counter()
+            ticket["future"].result()
+            wait_seconds = time.perf_counter() - waited
+            miss_started = time.perf_counter()
+            raw = bank.load_reusing(
+                layer, ids, workers=workers or WORKERS
+            )
+            miss_seconds = time.perf_counter() - miss_started
+            misses = bank.last_read_ids
+            _record_slab_read(
+                layer, misses, miss_seconds, prefetch=False
+            )
+            with _stats_lock:
+                stats["overlap_wait_s"] += wait_seconds
+                stats["overlap_layers"] += 1
+                stats["overlap_hits"] += len(ids) - len(misses)
+                stats["overlap_misses"] += len(misses)
+                stats["overlap_miss_s"] += miss_seconds
         yield raw
     finally:
         raw = None
@@ -191,10 +318,14 @@ def fetch_experts(
 
 
 def close() -> None:
-    global _store, _slabs, _slab_available
+    global _store, _slabs, _slab_available, _slab_executor
+    settle_slab_prefetches(raise_errors=False)
     with _slab_lock:
         slabs, _slabs = _slabs, None
         _slab_available = None
+        executor, _slab_executor = _slab_executor, None
+    if executor is not None:
+        executor.shutdown(wait=True)
     if slabs is not None:
         slabs.close()
     with _store_lock:

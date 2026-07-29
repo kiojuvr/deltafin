@@ -72,6 +72,8 @@ class ExpertSlabBank:
         self._views: list[dict[str, tuple[np.ndarray, np.ndarray]]] = []
         self._owners: list[object] = []
         self._expert_ids: tuple[int, ...] = ()
+        self._slot_experts: list[int | None] = [None] * capacity
+        self._last_read_ids: tuple[int, ...] = ()
         self._layer: int | None = None
         self._closed = False
         self._build_k3_views()
@@ -126,6 +128,85 @@ class ExpertSlabBank:
     def expert_ids(self) -> tuple[int, ...]:
         return self._expert_ids
 
+    @property
+    def last_read_ids(self) -> tuple[int, ...]:
+        return self._last_read_ids
+
+    def _layouts(self, layer: int, ids: tuple[int, ...]):
+        layouts = [self.store.expert_layout(layer, expert) for expert in ids]
+        for layout in layouts:
+            if layout.byte_length != self.slot_bytes:
+                raise ValueError(
+                    f"L{layer} E{layout.expert} is {layout.byte_length} bytes, "
+                    f"slot is {self.slot_bytes}"
+                )
+        return layouts
+
+    def _fill_slot(self, layer: int, layout, slot_index: int) -> None:
+        slot = memoryview(self._mapping)[
+            slot_index * self.slot_bytes:(slot_index + 1) * self.slot_bytes
+        ]
+        canonical_contiguous = layout.contiguous and all(
+            (
+                suffix := self.store._expert_suffix(tensor.name)
+            ) in K3_DESTINATIONS
+            and tensor.offset - layout.read_spans[0].offset
+            == K3_DESTINATIONS[suffix][0]
+            and tensor.byte_length == K3_DESTINATIONS[suffix][1]
+            for tensor in layout.tensors
+        )
+        if canonical_contiguous:
+            read_span = layout.read_spans[0]
+            self.store._read_into(
+                read_span.shard,
+                read_span.offset,
+                slot,
+                f"L{layer} E{layout.expert} -> {self.name}[{slot_index}]",
+            )
+            return
+        for tensor in layout.tensors:
+            suffix = self.store._expert_suffix(tensor.name)
+            try:
+                destination, expected_length = K3_DESTINATIONS[suffix]
+            except KeyError as exc:
+                raise ValueError(
+                    f"L{layer} E{layout.expert} has unexpected tensor "
+                    f"{suffix!r}"
+                ) from exc
+            if tensor.byte_length != expected_length:
+                raise ValueError(
+                    f"L{layer} E{layout.expert} {suffix} is "
+                    f"{tensor.byte_length} bytes, expected "
+                    f"{expected_length}"
+                )
+            target = slot[destination:destination + tensor.byte_length]
+            self.store._read_into(
+                tensor.shard,
+                tensor.offset,
+                target,
+                f"{tensor.name} -> {self.name}[{slot_index}]",
+            )
+
+    def _read_assignments(self, layer: int, assignments, workers: int) -> None:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(workers, max(1, len(assignments))),
+            thread_name_prefix=f"k3-{self.name}-pread",
+        ) as pool:
+            list(
+                pool.map(
+                    lambda row: self._fill_slot(layer, row[1], row[0]),
+                    assignments,
+                )
+            )
+
+    def _mapping_for(self, assigned):
+        return MappingProxyType(
+            {
+                expert: MappingProxyType(self._views[slot])
+                for expert, slot in assigned.items()
+            }
+        )
+
     def load(
         self, layer: int, expert_ids, *, workers: int = 8
     ) -> Mapping[int, Mapping[str, tuple[np.ndarray, np.ndarray]]]:
@@ -140,75 +221,67 @@ class ExpertSlabBank:
             raise ValueError("expert IDs must be unique")
         if workers <= 0:
             raise ValueError("workers must be positive")
-        layouts = [self.store.expert_layout(layer, expert) for expert in ids]
-        for layout in layouts:
-            if layout.byte_length != self.slot_bytes:
-                raise ValueError(
-                    f"L{layer} E{layout.expert} is {layout.byte_length} bytes, "
-                    f"slot is {self.slot_bytes}"
-                )
-
-        def fill(index: int) -> None:
-            layout = layouts[index]
-            slot = memoryview(self._mapping)[
-                index * self.slot_bytes:(index + 1) * self.slot_bytes
-            ]
-            canonical_contiguous = layout.contiguous and all(
-                (
-                    suffix := self.store._expert_suffix(tensor.name)
-                ) in K3_DESTINATIONS
-                and tensor.offset - layout.read_spans[0].offset
-                == K3_DESTINATIONS[suffix][0]
-                and tensor.byte_length == K3_DESTINATIONS[suffix][1]
-                for tensor in layout.tensors
-            )
-            if canonical_contiguous:
-                read_span = layout.read_spans[0]
-                self.store._read_into(
-                    read_span.shard,
-                    read_span.offset,
-                    slot,
-                    f"L{layer} E{layout.expert} -> {self.name}[{index}]",
-                )
-                return
-            for tensor in layout.tensors:
-                suffix = self.store._expert_suffix(tensor.name)
-                try:
-                    destination, expected_length = K3_DESTINATIONS[suffix]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"L{layer} E{layout.expert} has unexpected tensor "
-                        f"{suffix!r}"
-                    ) from exc
-                if tensor.byte_length != expected_length:
-                    raise ValueError(
-                        f"L{layer} E{layout.expert} {suffix} is "
-                        f"{tensor.byte_length} bytes, expected "
-                        f"{expected_length}"
-                    )
-                target = slot[
-                    destination:destination + tensor.byte_length
-                ]
-                self.store._read_into(
-                    tensor.shard,
-                    tensor.offset,
-                    target,
-                    f"{tensor.name} -> {self.name}[{index}]",
-                )
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(workers, max(1, len(ids))),
-            thread_name_prefix=f"k3-{self.name}-pread",
-        ) as pool:
-            list(pool.map(fill, range(len(ids))))
+        layouts = self._layouts(layer, ids)
+        assignments = [
+            (index, layout) for index, layout in enumerate(layouts)
+        ]
+        self._read_assignments(layer, assignments, workers)
         self._layer = layer
         self._expert_ids = ids
-        return MappingProxyType(
-            {
-                expert: MappingProxyType(self._views[index])
-                for index, expert in enumerate(ids)
-            }
+        self._slot_experts = list(ids) + [None] * (self.capacity - len(ids))
+        self._last_read_ids = ids
+        return self._mapping_for(
+            {expert: index for index, expert in enumerate(ids)}
         )
+
+    def load_reusing(
+        self, layer: int, expert_ids, *, workers: int = 8
+    ) -> Mapping[int, Mapping[str, tuple[np.ndarray, np.ndarray]]]:
+        """Retain same-layer slot hits and read only missing experts."""
+        if self._closed:
+            raise RuntimeError(f"{self.name} is closed")
+        ids = tuple(int(expert) for expert in expert_ids)
+        if len(ids) > self.capacity:
+            raise ValueError(
+                f"{self.name} holds {self.capacity} experts, got {len(ids)}"
+            )
+        if len(ids) != len(set(ids)):
+            raise ValueError("expert IDs must be unique")
+        if workers <= 0:
+            raise ValueError("workers must be positive")
+        if self._layer != layer:
+            return self.load(layer, ids, workers=workers)
+
+        old_slots = {
+            expert: slot
+            for slot, expert in enumerate(self._slot_experts)
+            if expert is not None
+        }
+        assigned = {
+            expert: old_slots[expert]
+            for expert in ids
+            if expert in old_slots
+        }
+        used_slots = set(assigned.values())
+        free_slots = [
+            slot for slot in range(self.capacity) if slot not in used_slots
+        ]
+        misses = tuple(expert for expert in ids if expert not in assigned)
+        miss_layouts = self._layouts(layer, misses)
+        assignments = []
+        for expert, layout, slot in zip(misses, miss_layouts, free_slots):
+            assigned[expert] = slot
+            assignments.append((slot, layout))
+        self._read_assignments(layer, assignments, workers)
+
+        slot_experts: list[int | None] = [None] * self.capacity
+        for expert, slot in assigned.items():
+            slot_experts[slot] = expert
+        self._slot_experts = slot_experts
+        self._layer = layer
+        self._expert_ids = ids
+        self._last_read_ids = misses
+        return self._mapping_for(assigned)
 
     def close(self) -> None:
         if self._closed:
@@ -216,6 +289,7 @@ class ExpertSlabBank:
         self._closed = True
         self._views.clear()
         self._owners.clear()
+        self._slot_experts.clear()
         self._array = None
         self._mapping.close()
 

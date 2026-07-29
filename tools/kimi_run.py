@@ -818,8 +818,17 @@ DIRECT_SLAB_ACTIVE = (
     and FAST_MOE
     and direct_shard_loader.slab_enabled()
 )
+DIRECT_OVERLAP_ACTIVE = (
+    DIRECT_SLAB_ACTIVE and direct_shard_loader.overlap_enabled()
+)
 if DIRECT_SLAB_ACTIVE:
     print("[config] direct expert source: reusable 16x2 aligned slabs", flush=True)
+if DIRECT_OVERLAP_ACTIVE:
+    print(
+        "[config] direct slab overlap: previous-token route, "
+        "same-layer slot reuse",
+        flush=True,
+    )
 
 
 def prefetch_prev_token():
@@ -1336,7 +1345,11 @@ def causal_mask(T, past=0, dtype=None):
 
 def forward_pass(layers, cache, hidden, step, verbose=True):
     """hidden: [1, T, H] fp32. Returns logits [1, T, vocab]."""
+    global _PREV_SEL
     T = hidden.shape[1]
+    if DIRECT_OVERLAP_ACTIVE:
+        _PREV_SEL = dict(_LAST_SEL)
+        direct_shard_loader.begin_slab_pass()
     if pilot.PILOT:
         pilot.init(config, DEV, _pilot_load, PFX,
                    load_packed=_load_int8_packed if QUANT else None,
@@ -1347,7 +1360,6 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
             if pilot.ASYNC_DRAIN:
                 pilot.install_async_drain(fetch_v2.reader())
     elif EXPERT_PREFETCH:
-        global _PREV_SEL
         _PREV_SEL = dict(_LAST_SEL)     # last token's routing = this pass's oracle
         fetch_v2.drop_prefetch()        # nothing from the previous pass is valid
     past = cache.get_seq_length() or 0
@@ -1365,6 +1377,10 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
     for i, layer in enumerate(layers):
         _step_ctx["layer"] = i
         layer_phase_before = dict(TIMES) if PROFILE else None
+        if DIRECT_OVERLAP_ACTIVE and i + 1 < NL:
+            predicted = _PREV_SEL.get(i + 1)
+            if predicted:
+                direct_shard_loader.prefetch_slab(i + 1, predicted)
         if TEMPLATES:
             layer.layer_idx = i
             layer.self_attn.layer_idx = i
@@ -1438,6 +1454,8 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                   f"exp {TIMES['expert_fetch']:.0f}s comp {TIMES['compute']:.0f}s)",
                   flush=True)
     TRACE.end_pass()
+    if DIRECT_OVERLAP_ACTIVE:
+        direct_shard_loader.settle_slab_prefetches()
     if PROFILE:
         mk = TIMES["moe_kernel"]
         print(f"[prof] KDA {PROF['kda']:.1f}s/{PROF['n_kda']} MLA {PROF['mla']:.1f}s/{PROF['n_mla']} "

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import pathlib
@@ -339,6 +340,107 @@ class LocalSafetensorsTests(unittest.TestCase):
         finally:
             direct_shard_loader.DIRECT_SLAB = old_enabled
             direct_shard_loader.close()
+
+    def test_slab_overlap_reuses_hits_and_reads_misses(self):
+        class Layout:
+            byte_length = 17
+
+        class FakeStore:
+            def expert_layout(self, layer, expert):
+                return Layout()
+
+            def close(self):
+                pass
+
+        class FakeBank:
+            def __init__(self):
+                self.layer = None
+                self.ids = ()
+                self.last_read_ids = ()
+
+            def load(self, layer, ids, workers):
+                self.layer = layer
+                self.ids = tuple(ids)
+                self.last_read_ids = self.ids
+                return {expert: {"slot": expert} for expert in ids}
+
+            def load_reusing(self, layer, ids, workers):
+                ids = tuple(ids)
+                old = set(self.ids) if self.layer == layer else set()
+                self.last_read_ids = tuple(
+                    expert for expert in ids if expert not in old
+                )
+                self.layer = layer
+                self.ids = ids
+                return {expert: {"slot": expert} for expert in ids}
+
+        class FakeSlabs:
+            def __init__(self):
+                self.banks = (FakeBank(), FakeBank())
+
+            def close(self):
+                pass
+
+        direct_shard_loader.close()
+        old_slab = direct_shard_loader.DIRECT_SLAB
+        old_overlap = direct_shard_loader.DIRECT_OVERLAP
+        old_stats = dict(direct_shard_loader.stats)
+        direct_shard_loader.DIRECT_SLAB = True
+        direct_shard_loader.DIRECT_OVERLAP = True
+        direct_shard_loader._store = FakeStore()
+        direct_shard_loader._slabs = FakeSlabs()
+        direct_shard_loader._slab_available = queue.Queue(maxsize=2)
+        direct_shard_loader._slab_available.put(0)
+        direct_shard_loader._slab_available.put(1)
+        direct_shard_loader._slab_executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        )
+        try:
+            self.assertTrue(
+                direct_shard_loader.prefetch_slab(2, [1, 2], workers=1)
+            )
+            with direct_shard_loader.slab_experts(
+                2, [2, 3], workers=1
+            ) as raw:
+                self.assertEqual(set(raw), {2, 3})
+            self.assertEqual(
+                direct_shard_loader.stats["overlap_hits"]
+                - old_stats["overlap_hits"],
+                1,
+            )
+            self.assertEqual(
+                direct_shard_loader.stats["overlap_misses"]
+                - old_stats["overlap_misses"],
+                1,
+            )
+        finally:
+            direct_shard_loader.DIRECT_SLAB = old_slab
+            direct_shard_loader.DIRECT_OVERLAP = old_overlap
+            direct_shard_loader.close()
+            direct_shard_loader.stats.update(old_stats)
+
+    def test_slab_settle_releases_every_bank_after_failure(self):
+        direct_shard_loader.close()
+        available = queue.Queue(maxsize=2)
+        failed = concurrent.futures.Future()
+        failed.set_exception(RuntimeError("prefetch failed"))
+        completed = concurrent.futures.Future()
+        completed.set_result(None)
+        direct_shard_loader._slab_available = available
+        direct_shard_loader._slab_pending.update(
+            {
+                1: {"bank_index": 0, "future": failed},
+                2: {"bank_index": 1, "future": completed},
+            }
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "prefetch failed"):
+                direct_shard_loader.settle_slab_prefetches()
+            self.assertEqual(available.qsize(), 2)
+            self.assertFalse(direct_shard_loader._slab_pending)
+        finally:
+            direct_shard_loader._slab_pending.clear()
+            direct_shard_loader._slab_available = None
 
 
 if __name__ == "__main__":
