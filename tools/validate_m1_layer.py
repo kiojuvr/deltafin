@@ -10,6 +10,7 @@ import datetime as dt
 import gc
 import importlib
 import json
+import math
 import mmap
 import os
 import pathlib
@@ -707,6 +708,22 @@ def main(argv=None) -> int:
         args.model_dir, sidecar=args.sidecar
     ) as store:
         loader = DirectResidentLoader(store)
+        resident_spans = [
+            store.tensor_span(name) for name in loader.resident_names()
+        ]
+        dtype_counts: dict[str, int] = {}
+        for span in resident_spans:
+            dtype_counts[span.dtype] = dtype_counts.get(span.dtype, 0) + 1
+        evidence["resident_inventory"] = {
+            "tensors": len(resident_spans),
+            "checkpoint_bytes": sum(
+                span.byte_length for span in resident_spans
+            ),
+            "float32_materialized_bytes": sum(
+                math.prod(span.shape) * 4 for span in resident_spans
+            ),
+            "dtype_counts": dtype_counts,
+        }
         print("[1/5] resident tensor byte parity", flush=True)
         evidence["resident_validation"] = validate_resident_bytes(
             store, loader, args.layer

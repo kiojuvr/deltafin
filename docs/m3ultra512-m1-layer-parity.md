@@ -120,6 +120,14 @@ The checkpoint representation of the layer is 1,267,744,256 bytes. Peak RSS is
 monotonic and allocator reuse is involved, so these figures must not be added
 to peak RSS as if they were independent snapshots.
 
+The complete non-routed inventory contains 2,628 tensors: 2,122 BF16 and 506
+F32. Its official checkpoint payload is 114,404,258,816 bytes. Materializing
+every tensor into the current exact float32 runtime representation would require
+228,764,027,904 bytes before recurrent state, allocator overhead, Metal arenas,
+expert slabs, or file cache. M1-D therefore must budget approximately 228.8 GB,
+not only the 114.4 GB on-disk payload, unless the resident compute path gains a
+verified BF16 representation.
+
 ## Metal status
 
 All 16 bank A experts passed the existing `metal_moe._span_ptr` contract:
