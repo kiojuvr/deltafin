@@ -201,6 +201,7 @@ startup. These variables exist for overriding that:
 |---|---|---|
 | `K3_DEV` | auto | `mps` when available, then `cuda`, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
 | `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
+| `K3_EXPERT_SOURCE` | `cache-http` | `direct-shards` reads routed experts with positional I/O from an unmodified local official checkpoint; see [the M3 Ultra direct-shard report](docs/m3ultra512-direct-shards.md) |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |
