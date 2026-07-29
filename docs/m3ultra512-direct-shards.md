@@ -103,22 +103,22 @@ cache purge was performed, so “first” is explicitly a cold candidate.
 
 | Measurement | Result | Effective bandwidth |
 |---|---:|---:|
-| Index + 96 headers + complete inventory | 2.42 s | — |
-| Sidecar generation | 0.786 s | — |
-| Sidecar reload | 2.58 s | — |
-| Single expert, first buffered read | 21.4 ms | 0.820 GB/s |
-| Single expert, immediate second read | 1.75 ms | 10.00 GB/s |
-| Same expert, repeated median | 1.16 ms | 15.17 GB/s |
-| 16 experts, sequential `F_NOCACHE` | 322 ms | 0.871 GB/s |
-| 16 experts, 8-way parallel `F_NOCACHE` | 41.5 ms | 6.77 GB/s |
+| Index + 96 headers + complete inventory | 2.43 s | — |
+| Sidecar generation | 0.797 s | — |
+| Sidecar reload | 2.60 s | — |
+| Single expert, first buffered read | 21.5 ms | 0.815 GB/s |
+| Single expert, immediate second read | 1.45 ms | 12.08 GB/s |
+| Same expert, repeated median | 1.25 ms | 14.07 GB/s |
+| 16 experts, sequential `F_NOCACHE` | 323 ms | 0.868 GB/s |
+| 16 experts, 8-way parallel `F_NOCACHE` | 40.8 ms | 6.89 GB/s |
 
-The immediate second read was 12.2 times faster than the first candidate,
+The immediate second read was 14.8 times faster than the first candidate,
 demonstrating why buffered and physical-read measurements must not be mixed.
 
 ## Current bottleneck and next phase
 
-The direct storage path reaches 6.77 GB/s with eight positional reads, while a
-single sequential stream reaches only 0.871 GB/s. Physical I/O parallelism is
+The direct storage path reaches 6.89 GB/s with eight positional reads, while a
+single sequential stream reaches only 0.868 GB/s. Physical I/O parallelism is
 therefore still essential. Warm page-cache reads are much faster, but the
 1.45 TB expert set cannot be treated as resident even on a 512 GB machine.
 The correctness-first reader also returns Python-owned byte buffers. They are
