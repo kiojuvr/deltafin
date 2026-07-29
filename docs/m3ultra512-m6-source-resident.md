@@ -120,19 +120,19 @@ about 120.06 GB; no layer weight tree remained.
 ## Performance
 
 This run started with checkpoint pages already warm. Its 114.404 GB source bank
-load took 21.097 seconds, an apparent 5.423 GB/s. This is a logical,
+load took 21.017 seconds, an apparent 5.443 GB/s. This is a logical,
 page-cache-assisted rate, not physical USB RAID bandwidth.
 
 Warm serial decode:
 
 | Metric | FP32 bank (M4 evidence) | Source bank (M6) |
 |---|---:|---:|
-| Mean wall time/token | 3.642 s | 4.024 s |
+| Mean wall time/token | 3.642 s | 4.029 s |
 | Resident materialization/token | ~0 s | 0.379 s |
 | Expert wait/token | 0.605 s | 0.617 s |
-| Physical RAID bytes, 8 tokens | 1.16 MB | 4.29 MB |
+| Physical RAID bytes, 8 tokens | 1.16 MB | 4.58 MB |
 
-The measured warm cost is 0.382 seconds/token, or about 10.5%. Nearly all of
+The measured warm cost is 0.387 seconds/token, or about 10.6%. Nearly all of
 that cost is the 93 BF16/F32-to-FP32 layer materializations. This trade saves
 114.36 GB of permanent MPS weight storage.
 
