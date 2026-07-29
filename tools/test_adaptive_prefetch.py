@@ -66,6 +66,25 @@ class AdaptiveRoutePrefetchTests(unittest.TestCase):
         self.assertEqual(snapshot["predicted_experts"], 0)
         self.assertEqual(snapshot["eligible_prefix"], 0)
 
+    def test_io_gate_skips_without_spending_budget(self):
+        policy = self.policy(
+            warmup_observations=1, min_wilson_precision=0.0
+        )
+        policy.begin_pass({1: (1, 2, 3, 4)})
+        policy.observe(1, {1, 2, 3, 4})
+        policy.begin_pass(
+            {1: (1, 2, 3, 4), 2: (5, 6, 7, 8), 3: (9, 10, 11, 12)}
+        )
+        self.assertEqual(policy.predict(1, gate="no-signal"), ())
+        self.assertEqual(policy.predict(2, gate="closed"), ())
+        self.assertEqual(policy.predict(3, gate="open"), (9, 10, 11, 12))
+        snapshot = policy.snapshot()
+        self.assertEqual(snapshot["gate_no_signal_layers"], 1)
+        self.assertEqual(snapshot["gate_closed_layers"], 2)
+        self.assertEqual(snapshot["gate_open_layers"], 1)
+        self.assertEqual(snapshot["gate_skipped_experts"], 8)
+        self.assertEqual(snapshot["current_token_prefetch_bytes"], 40)
+
 
 if __name__ == "__main__":
     unittest.main()

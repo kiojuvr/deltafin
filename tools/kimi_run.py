@@ -826,6 +826,14 @@ DIRECT_OVERLAP_ACTIVE = (
 DIRECT_OVERLAP_POLICY = os.environ.get(
     "K3_DIRECT_OVERLAP_POLICY", "full"
 )
+DIRECT_PREFETCH_COLD_ONLY = (
+    os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY", "0") == "1"
+)
+DIRECT_PREFETCH_COLD_GBPS = float(
+    os.environ.get("K3_DIRECT_PREFETCH_COLD_GBPS", "5.0")
+)
+if DIRECT_PREFETCH_COLD_GBPS <= 0:
+    raise ValueError("K3_DIRECT_PREFETCH_COLD_GBPS must be positive")
 if DIRECT_OVERLAP_POLICY not in ("full", "adaptive"):
     raise ValueError(
         "K3_DIRECT_OVERLAP_POLICY must be full or adaptive"
@@ -863,6 +871,12 @@ if DIRECT_OVERLAP_ACTIVE:
         "same-layer slot reuse",
         flush=True,
     )
+    if DIRECT_ADAPTIVE_POLICY is not None and DIRECT_PREFETCH_COLD_ONLY:
+        print(
+            "[config] direct adaptive I/O gate: demand EMA <= "
+            f"{DIRECT_PREFETCH_COLD_GBPS:.2f} GB/s",
+            flush=True,
+        )
 
 
 def prefetch_prev_token():
@@ -1432,7 +1446,17 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
             if DIRECT_ADAPTIVE_POLICY is None:
                 predicted = _PREV_SEL.get(i + 1, ())
             else:
-                predicted = DIRECT_ADAPTIVE_POLICY.predict(i + 1)
+                gate = "open"
+                if DIRECT_PREFETCH_COLD_ONLY:
+                    demand = direct_shard_loader.demand_read_snapshot()
+                    bandwidth = demand["ema_gbps"]
+                    if bandwidth is None:
+                        gate = "no-signal"
+                    elif bandwidth > DIRECT_PREFETCH_COLD_GBPS:
+                        gate = "closed"
+                predicted = DIRECT_ADAPTIVE_POLICY.predict(
+                    i + 1, gate=gate
+                )
             if predicted and len(predicted) <= 16:
                 direct_shard_loader.prefetch_slab(i + 1, predicted)
         if TEMPLATES:

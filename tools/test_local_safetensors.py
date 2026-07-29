@@ -442,6 +442,28 @@ class LocalSafetensorsTests(unittest.TestCase):
             direct_shard_loader._slab_pending.clear()
             direct_shard_loader._slab_available = None
 
+    def test_demand_bandwidth_signal_excludes_reset_state(self):
+        old_stats = dict(direct_shard_loader.stats)
+        direct_shard_loader.reset_demand_signal()
+        try:
+            self.assertIsNone(
+                direct_shard_loader.demand_read_snapshot()["ema_gbps"]
+            )
+            direct_shard_loader._record_demand_read(1_000_000_000, 1.0)
+            first = direct_shard_loader.demand_read_snapshot()
+            self.assertEqual(first["last_gbps"], 1.0)
+            self.assertEqual(first["ema_gbps"], 1.0)
+            direct_shard_loader._record_demand_read(1_000_000_000, 0.5)
+            second = direct_shard_loader.demand_read_snapshot()
+            self.assertEqual(second["last_gbps"], 2.0)
+            self.assertEqual(
+                second["ema_gbps"],
+                1.0 + direct_shard_loader.DEMAND_EMA_ALPHA,
+            )
+        finally:
+            direct_shard_loader.reset_demand_signal()
+            direct_shard_loader.stats.update(old_stats)
+
 
 if __name__ == "__main__":
     unittest.main()

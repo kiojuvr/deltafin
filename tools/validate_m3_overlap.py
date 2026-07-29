@@ -46,6 +46,16 @@ def parse_args(argv=None):
     parser.add_argument("--token-id", type=int, default=1008)
     parser.add_argument("--tokens", type=int, default=4)
     parser.add_argument(
+        "--sequence-order",
+        choices=("serial-first", "adaptive-first"),
+        default="serial-first",
+    )
+    parser.add_argument(
+        "--darwin-nocache",
+        action="store_true",
+        help="enable F_NOCACHE after validating the normal M3 profile",
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=ROOT / "bench-results/m3-overlap.json",
@@ -118,6 +128,7 @@ def run_sequence(
     direct_shard_loader.DIRECT_OVERLAP = overlap
     kr.DIRECT_OVERLAP_ACTIVE = overlap and kr.DIRECT_SLAB_ACTIVE
     reset_runtime_counters(kr, direct_shard_loader)
+    direct_shard_loader.reset_demand_signal()
     kr._LAST_SEL.clear()
     kr._PREV_SEL.clear()
     if hasattr(kr, "_LAST_ROUTE_RANK"):
@@ -135,6 +146,7 @@ def run_sequence(
     sequence_started = time.perf_counter()
     sequence_before = memory_snapshot(f"{label}-before")
     for step in range(tokens):
+        demand_before = direct_shard_loader.demand_read_snapshot()
         policy_before = (
             adaptive_policy.snapshot()
             if adaptive_policy is not None else None
@@ -160,6 +172,7 @@ def run_sequence(
             adaptive_policy.snapshot()
             if adaptive_policy is not None else None
         )
+        demand_after = direct_shard_loader.demand_read_snapshot()
         stats_delta = numeric_delta(
             direct_shard_loader.stats, stats_before
         )
@@ -185,6 +198,8 @@ def run_sequence(
             "direct_stats": stats_delta,
             "locality_vs_previous_token": local,
             "adaptive_policy": policy_after,
+            "demand_read_before": demand_before,
+            "demand_read_after": demand_after,
             "routes": routes,
             "logits": logits_summary(cpu_logits),
             "layer_profile": copy.deepcopy(
@@ -337,6 +352,8 @@ def main(argv=None) -> int:
     if args.tokens < 2:
         raise ValueError("--tokens must be at least 2")
     require_profile()
+    if args.darwin_nocache:
+        os.environ["K3_PREAD_NOCACHE"] = "1"
     if os.environ.get("K3_DIRECT_OVERLAP") not in ("0", "1"):
         raise RuntimeError("set K3_DIRECT_OVERLAP=0 or 1 explicitly")
     torch.set_grad_enabled(False)
@@ -345,9 +362,13 @@ def main(argv=None) -> int:
     tree_before = model_tree_fingerprint(model_dir)
     evidence: dict[str, Any] = {
         "schema": (
-            "deltafin.m4-adaptive.v1"
-            if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
-            else "deltafin.m3-overlap.v1"
+            "deltafin.m5-cold-gate.v1"
+            if os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY") == "1"
+            else (
+                "deltafin.m4-adaptive.v1"
+                if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
+                else "deltafin.m3-overlap.v1"
+            )
         ),
         "status": "running",
         "created_at": now(),
@@ -356,6 +377,8 @@ def main(argv=None) -> int:
         ).strip(),
         "token_id": args.token_id,
         "tokens": args.tokens,
+        "sequence_order": args.sequence_order,
+        "darwin_nocache": args.darwin_nocache,
         "baseline": baseline,
         "official_tree_before": tree_before,
         "model_files_modified": False,
@@ -400,6 +423,11 @@ def main(argv=None) -> int:
                     "min_wilson_precision": (
                         kr.DIRECT_ADAPTIVE_POLICY.min_wilson_precision
                     ),
+                    "cold_only": kr.DIRECT_PREFETCH_COLD_ONLY,
+                    "cold_gbps": kr.DIRECT_PREFETCH_COLD_GBPS,
+                    "demand_ema_alpha": (
+                        direct_shard_loader.DEMAND_EMA_ALPHA
+                    ),
                 }
                 if kr.DIRECT_ADAPTIVE_POLICY is not None else None
             ),
@@ -409,62 +437,60 @@ def main(argv=None) -> int:
         evidence["source_before"] = source_before
         layers = kr.build_layers()
 
-        serial_first, serial_first_logits = run_sequence(
-            kr,
-            direct_shard_loader,
-            layers,
-            label="serial-first",
-            token_id=args.token_id,
-            tokens=args.tokens,
-            overlap=False,
-            progress=progress,
-        )
-        evidence["sequences"]["serial_first"] = serial_first
-        write_evidence(args.output, evidence)
+        if args.sequence_order == "serial-first":
+            sequence_specs = (
+                ("serial_first", "serial-first", False),
+                ("serial_warm", "serial-warm", False),
+                ("overlap_warm", "overlap-warm", True),
+            )
+        else:
+            sequence_specs = (
+                ("overlap_first", "overlap-first", True),
+                ("serial_warm", "serial-warm", False),
+                ("overlap_warm", "overlap-warm", True),
+            )
+        sequence_logits = {}
+        for key, label, overlap in sequence_specs:
+            sequence, logits = run_sequence(
+                kr,
+                direct_shard_loader,
+                layers,
+                label=label,
+                token_id=args.token_id,
+                tokens=args.tokens,
+                overlap=overlap,
+                progress=progress,
+            )
+            evidence["sequences"][key] = sequence
+            sequence_logits[key] = logits
+            write_evidence(args.output, evidence)
 
-        serial_warm, serial_warm_logits = run_sequence(
-            kr,
-            direct_shard_loader,
-            layers,
-            label="serial-warm",
-            token_id=args.token_id,
-            tokens=args.tokens,
-            overlap=False,
-            progress=progress,
-        )
-        evidence["sequences"]["serial_warm"] = serial_warm
-        evidence["serial_repeat_parity"] = compare_sequences(
-            serial_first,
-            serial_warm,
-            serial_first_logits,
-            serial_warm_logits,
-        )
-        write_evidence(args.output, evidence)
-
-        overlap_warm, overlap_logits = run_sequence(
-            kr,
-            direct_shard_loader,
-            layers,
-            label="overlap-warm",
-            token_id=args.token_id,
-            tokens=args.tokens,
-            overlap=True,
-            progress=progress,
-        )
-        evidence["sequences"]["overlap_warm"] = overlap_warm
+        if args.sequence_order == "serial-first":
+            evidence["serial_repeat_parity"] = compare_sequences(
+                evidence["sequences"]["serial_first"],
+                evidence["sequences"]["serial_warm"],
+                sequence_logits["serial_first"],
+                sequence_logits["serial_warm"],
+            )
+        else:
+            evidence["cold_overlap_parity"] = compare_sequences(
+                evidence["sequences"]["overlap_first"],
+                evidence["sequences"]["serial_warm"],
+                sequence_logits["overlap_first"],
+                sequence_logits["serial_warm"],
+            )
         evidence["overlap_parity"] = compare_sequences(
-            serial_warm,
-            overlap_warm,
-            serial_warm_logits,
-            overlap_logits,
+            evidence["sequences"]["serial_warm"],
+            evidence["sequences"]["overlap_warm"],
+            sequence_logits["serial_warm"],
+            sequence_logits["overlap_warm"],
         )
         evidence["aggregate"] = {
             name: aggregate(sequence)
             for name, sequence in evidence["sequences"].items()
         }
-        all_logits.extend(
-            serial_first_logits + serial_warm_logits + overlap_logits
-        )
+        for logits in sequence_logits.values():
+            all_logits.extend(logits)
         source_after = model_fingerprint(store)
         tree_after = model_tree_fingerprint(model_dir)
         evidence["source_after"] = source_after

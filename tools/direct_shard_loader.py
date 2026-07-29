@@ -32,6 +32,11 @@ DIRECT_OVERLAP = os.environ.get("K3_DIRECT_OVERLAP", "0") == "1"
 DARWIN_NOCACHE = os.environ.get(
     "K3_PREAD_NOCACHE", "0"
 ) == "1"
+DEMAND_EMA_ALPHA = float(
+    os.environ.get("K3_DIRECT_DEMAND_EMA_ALPHA", "0.25")
+)
+if not 0.0 < DEMAND_EMA_ALPHA <= 1.0:
+    raise ValueError("K3_DIRECT_DEMAND_EMA_ALPHA must be in (0, 1]")
 
 stats = {
     "expert_http": 0,
@@ -54,8 +59,15 @@ stats = {
     "overlap_hits": 0,
     "overlap_misses": 0,
     "overlap_miss_s": 0.0,
+    "demand_reads": 0,
+    "demand_bytes": 0,
+    "demand_s": 0.0,
+    "demand_last_gbps": 0.0,
+    "demand_ema_gbps": 0.0,
 }
 _stats_lock = threading.Lock()
+_demand_last_gbps: float | None = None
+_demand_ema_gbps: float | None = None
 _store_lock = threading.Lock()
 _store: LocalSafetensorsStore | None = None
 _slab_lock = threading.Lock()
@@ -132,6 +144,44 @@ def _read_bytes(layer: int, ids) -> int:
     )
 
 
+def reset_demand_signal() -> None:
+    global _demand_last_gbps, _demand_ema_gbps
+    with _stats_lock:
+        _demand_last_gbps = None
+        _demand_ema_gbps = None
+
+
+def demand_read_snapshot() -> dict[str, float | int | None]:
+    with _stats_lock:
+        return {
+            "last_gbps": _demand_last_gbps,
+            "ema_gbps": _demand_ema_gbps,
+            "reads": stats["demand_reads"],
+            "bytes": stats["demand_bytes"],
+            "seconds": stats["demand_s"],
+            "ema_alpha": DEMAND_EMA_ALPHA,
+        }
+
+
+def _record_demand_read(byte_count: int, elapsed: float) -> None:
+    global _demand_last_gbps, _demand_ema_gbps
+    bandwidth = byte_count / max(elapsed, 1e-12) / 1e9
+    with _stats_lock:
+        _demand_last_gbps = bandwidth
+        if _demand_ema_gbps is None:
+            _demand_ema_gbps = bandwidth
+        else:
+            _demand_ema_gbps = (
+                DEMAND_EMA_ALPHA * bandwidth
+                + (1.0 - DEMAND_EMA_ALPHA) * _demand_ema_gbps
+            )
+        stats["demand_reads"] += 1
+        stats["demand_bytes"] += byte_count
+        stats["demand_s"] += elapsed
+        stats["demand_last_gbps"] = _demand_last_gbps
+        stats["demand_ema_gbps"] = _demand_ema_gbps
+
+
 def _record_slab_read(
     layer: int, ids, elapsed: float, *, prefetch: bool
 ) -> None:
@@ -152,6 +202,8 @@ def _record_slab_read(
             stats["overlap_prefetch_experts"] += len(ids)
             stats["overlap_prefetch_bytes"] += byte_count
             stats["overlap_prefetch_s"] += elapsed
+    if not prefetch:
+        _record_demand_read(byte_count, elapsed)
 
 
 def begin_slab_pass() -> None:

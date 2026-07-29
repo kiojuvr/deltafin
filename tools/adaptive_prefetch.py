@@ -54,6 +54,10 @@ class AdaptiveRoutePrefetch:
         self._observed_layers = 0
         self._predicted_experts = 0
         self._predicted_hits = 0
+        self._gate_open_layers = 0
+        self._gate_closed_layers = 0
+        self._gate_no_signal_layers = 0
+        self._gate_skipped_experts = 0
 
     @staticmethod
     def _wilson_lower(hits: int, observations: int, z: float) -> float:
@@ -98,7 +102,11 @@ class AdaptiveRoutePrefetch:
             eligible += 1
         return eligible
 
-    def predict(self, layer: int) -> tuple[int, ...]:
+    def predict(
+        self, layer: int, *, gate: str = "open"
+    ) -> tuple[int, ...]:
+        if gate not in ("open", "closed", "no-signal"):
+            raise ValueError("gate must be open, closed, or no-signal")
         ranking = self._previous.get(int(layer), ())
         if not ranking or self.token_budget_bytes == 0:
             return ()
@@ -112,8 +120,15 @@ class AdaptiveRoutePrefetch:
             len(ranking),
             budget_experts,
         )
+        if count and gate != "open":
+            self._gate_closed_layers += 1
+            self._gate_skipped_experts += count
+            if gate == "no-signal":
+                self._gate_no_signal_layers += 1
+            return ()
         predicted = ranking[:count]
         if predicted:
+            self._gate_open_layers += 1
             self._issued_by_layer[int(layer)] = predicted
             added = len(predicted) * self.expert_bytes
             self._token_prefetch_bytes += added
@@ -164,4 +179,8 @@ class AdaptiveRoutePrefetch:
             ),
             "current_token_prefetch_bytes": self._token_prefetch_bytes,
             "token_budget_bytes": self.token_budget_bytes,
+            "gate_open_layers": self._gate_open_layers,
+            "gate_closed_layers": self._gate_closed_layers,
+            "gate_no_signal_layers": self._gate_no_signal_layers,
+            "gate_skipped_experts": self._gate_skipped_experts,
         }
