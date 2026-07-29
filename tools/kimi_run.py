@@ -745,6 +745,19 @@ elif EXPERT_SOURCE != "cache-http":
         f"got {EXPERT_SOURCE!r}"
     )
 
+RESIDENT_SOURCE = os.environ.get("K3_RESIDENT_SOURCE", "cache-http")
+if RESIDENT_SOURCE == "direct-shards":
+    import direct_shard_loader
+    import resident_shard_loader
+    k3loader.load_resident = resident_shard_loader.load_resident
+    print(f"[config] resident source: direct official shards "
+          f"({direct_shard_loader.MODEL_DIR})", flush=True)
+elif RESIDENT_SOURCE != "cache-http":
+    raise ValueError(
+        "K3_RESIDENT_SOURCE must be cache-http or direct-shards, "
+        f"got {RESIDENT_SOURCE!r}"
+    )
+
 # K3_EXPERT_READ=pread (see tools/fetch_v2.py) reads the layer's whole selected
 # set through a threaded pread pool instead of demand-faulting mmap pages inside
 # the GEMV kernel. K3_EXPERT_PREFETCH=1 additionally starts layer L+1's reads

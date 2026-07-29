@@ -183,6 +183,22 @@ def _pread_exact(fd: int, length: int, offset: int, label: str) -> bytes:
     return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
+def _preadv_exact(fd: int, target: memoryview, offset: int, label: str) -> int:
+    """Fill a writable buffer directly with positional I/O."""
+    if target.readonly:
+        raise TypeError(f"{label}: destination buffer is read-only")
+    target = target.cast("B")
+    done = 0
+    while done < target.nbytes:
+        count = os.preadv(fd, [target[done:]], offset + done)
+        if count <= 0:
+            raise IOError(
+                f"short preadv for {label}: {done}/{target.nbytes} bytes"
+            )
+        done += count
+    return done
+
+
 def _shape_nbytes(dtype: str, shape: tuple[int, ...]) -> int:
     try:
         itemsize = _ITEMSIZE[dtype]
@@ -348,6 +364,19 @@ class LocalSafetensorsStore:
     def read_tensor(self, name: str) -> np.ndarray:
         span = self.tensor_span(name)
         return _tensor_array(span, self.read_tensor_bytes(name))
+
+    def read_tensor_into(self, name: str, destination) -> int:
+        """Read a tensor directly into an exactly-sized writable buffer."""
+        span = self.tensor_span(name)
+        target = memoryview(destination)
+        if target.nbytes != span.byte_length:
+            raise ValueError(
+                f"{name!r} needs {span.byte_length} bytes, destination has "
+                f"{target.nbytes}"
+            )
+        return self._read_into(
+            span.shard, span.offset, target, span.name
+        )
 
     def read_expert(self, layer: int, expert: int) -> Mapping[str, np.ndarray]:
         """Read one expert, coalescing adjacent tensors when the header permits."""
@@ -676,6 +705,12 @@ class LocalSafetensorsStore:
     def _read_span(self, shard: str, offset: int, length: int, label: str) -> bytes:
         fd = self._get_fd(shard)
         return _pread_exact(fd, length, offset, label)
+
+    def _read_into(
+        self, shard: str, offset: int, destination: memoryview, label: str
+    ) -> int:
+        fd = self._get_fd(shard)
+        return _preadv_exact(fd, destination, offset, label)
 
     def _load_sidecar(self, sidecar_path: pathlib.Path) -> None:
         try:

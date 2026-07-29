@@ -22,6 +22,7 @@ from local_safetensors import (  # noqa: E402
     UnknownTensorError,
 )
 import direct_shard_loader  # noqa: E402
+from resident_shard_loader import DirectResidentLoader  # noqa: E402
 
 
 PREFIX = "language_model.model.layers"
@@ -89,6 +90,10 @@ class LocalSafetensorsTests(unittest.TestCase):
         arrays_b = [
             (self.names["e"], np.array([5, 4], dtype=np.uint8)),
             ("resident.scalar", np.array([7.25], dtype=np.float32)),
+            (
+                "resident.matrix",
+                np.arange(12, dtype=np.float32).reshape(3, 4),
+            ),
         ]
         write_shard(self.root / shard_a, arrays_a)
         write_shard(self.root / shard_b, arrays_b)
@@ -108,7 +113,7 @@ class LocalSafetensorsTests(unittest.TestCase):
     def test_inventory_contiguous_fallback_and_standard_reader_match(self):
         with LocalSafetensorsStore(self.root) as store:
             self.assertEqual(store.shard_count, 2)
-            self.assertEqual(store.tensor_count, 10)
+            self.assertEqual(store.tensor_count, 11)
             layout0 = store.expert_layout(1, 0)
             self.assertFalse(layout0.contiguous)
             self.assertEqual(len(layout0.read_spans), 2)
@@ -150,6 +155,17 @@ class LocalSafetensorsTests(unittest.TestCase):
 
             one = store.read_tensor("resident.scalar")
             np.testing.assert_array_equal(one, np.array([7.25], dtype=np.float32))
+            destination = bytearray(store.tensor_span("resident.matrix").byte_length)
+            self.assertEqual(
+                store.read_tensor_into("resident.matrix", destination),
+                len(destination),
+            )
+            np.testing.assert_array_equal(
+                np.frombuffer(destination, dtype=np.float32).reshape(3, 4),
+                np.arange(12, dtype=np.float32).reshape(3, 4),
+            )
+            with self.assertRaisesRegex(ValueError, "destination has"):
+                store.read_tensor_into("resident.matrix", bytearray(1))
             self.assertGreater(store.open_fd_count, 0)
         self.assertEqual(store.open_fd_count, 0)
 
@@ -198,6 +214,23 @@ class LocalSafetensorsTests(unittest.TestCase):
         finally:
             direct_shard_loader.close()
         self.assertEqual(direct_shard_loader._store, None)
+
+    def test_partial_resident_loader(self):
+        with LocalSafetensorsStore(self.root) as store:
+            loader = DirectResidentLoader(store)
+            self.assertIn("resident.scalar", loader.resident_names())
+            scalar = loader.read_torch("resident.scalar")
+            self.assertEqual(scalar.dtype, __import__("torch").float32)
+            self.assertEqual(scalar.tolist(), [7.25])
+            rows = loader.read_rows_torch("resident.matrix", [2, 0])
+            np.testing.assert_array_equal(
+                rows.numpy(),
+                np.array([[8, 9, 10, 11], [0, 1, 2, 3]], dtype=np.float32),
+            )
+            with self.assertRaisesRegex(IndexError, "row outside"):
+                loader.read_rows_torch("resident.matrix", [3])
+            with self.assertRaisesRegex(ValueError, "routed-expert"):
+                loader.read_bytes(self.names["a"])
 
 
 if __name__ == "__main__":
