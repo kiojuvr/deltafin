@@ -753,6 +753,14 @@ elif EXPERT_SOURCE != "cache-http":
     )
 
 RESIDENT_SOURCE = os.environ.get("K3_RESIDENT_SOURCE", "cache-http")
+RESIDENT_BANK_DTYPE = os.environ.get(
+    "K3_RESIDENT_BANK_DTYPE", "runtime"
+).strip().lower()
+if RESIDENT_BANK_DTYPE not in ("runtime", "source"):
+    raise ValueError(
+        "K3_RESIDENT_BANK_DTYPE must be runtime or source, "
+        f"got {RESIDENT_BANK_DTYPE!r}"
+    )
 if RESIDENT_SOURCE == "direct-shards":
     import direct_shard_loader
     import resident_shard_loader
@@ -762,6 +770,12 @@ if RESIDENT_SOURCE == "direct-shards":
     if os.environ.get("K3_RESIDENT_BANK", "0") == "1":
         if DEV.type != "mps":
             raise RuntimeError("K3_RESIDENT_BANK=1 requires K3_DEV=mps")
+        if RESIDENT_BANK_DTYPE == "source" and PIN_N != 0:
+            raise RuntimeError(
+                "K3_RESIDENT_BANK_DTYPE=source requires K3_PIN_LAYERS=0; "
+                "otherwise per-layer runtime-dtype copies remain permanently "
+                "owned by the layer modules"
+            )
 
         def _resident_bank_progress(index, total, label, bank, report):
             print(
@@ -774,9 +788,16 @@ if RESIDENT_SOURCE == "direct-shards":
 
         resident_shard_loader.build_runtime_bank(
             device=DEV,
-            dtype=DT,
+            dtype=None if RESIDENT_BANK_DTYPE == "source" else DT,
             layers_per_stage=8,
             progress=_resident_bank_progress,
+        )
+        bank = resident_shard_loader.runtime_bank()
+        print(
+            f"[resident-bank] storage={bank.storage_dtype}, "
+            f"checkpoint={bank.checkpoint_bytes / 1e9:.3f} GB, "
+            f"materialized={bank.materialized_bytes / 1e9:.3f} GB",
+            flush=True,
         )
 elif RESIDENT_SOURCE != "cache-http":
     raise ValueError(
@@ -1136,7 +1157,12 @@ class LazyEmbed:
         tids = [int(t) for t in ids]
         if self._resident is not None:
             index = torch.tensor(tids, dtype=torch.int64, device=DEV)
-            return self._resident.index_select(0, index).unsqueeze(0)
+            # A source-dtype resident bank keeps the full embedding in BF16.
+            # Only the selected rows become runtime dtype, so no full FP32
+            # embedding copy survives between calls.
+            return self._resident.index_select(0, index).to(
+                device=DEV, dtype=DT
+            ).unsqueeze(0)
         buf = (self._local_rows(tids) if self._ensure_fd() is not None
                else b"".join(self._row(tid) for tid in tids))
         t = torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(len(tids), H)
@@ -1851,6 +1877,7 @@ def main():
             "device": str(DEV),
             "spine": SPINE,
             "dtype": str(DT),
+            "resident_bank_dtype": RESIDENT_BANK_DTYPE,
             "approx": APPROX,
             "templates": TEMPLATES,
             "template_arena": bool(_TEMPLATE_ARENA_STORAGE is not None),

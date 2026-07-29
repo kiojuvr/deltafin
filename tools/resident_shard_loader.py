@@ -275,7 +275,7 @@ class ResidentTensorBank:
         loader: DirectResidentLoader,
         *,
         device: torch.device | str = "mps",
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype | None = torch.float32,
     ):
         self.loader = loader
         self.device = torch.device(device)
@@ -283,6 +283,7 @@ class ResidentTensorBank:
         self._tensors: dict[str, torch.Tensor] = {}
         self._checkpoint_bytes = 0
         self._materialized_bytes = 0
+        self._load_seconds = 0.0
 
     def __len__(self) -> int:
         return len(self._tensors)
@@ -299,8 +300,17 @@ class ResidentTensorBank:
         return self._materialized_bytes
 
     @property
+    def load_seconds(self) -> float:
+        return self._load_seconds
+
+    @property
     def names(self) -> tuple[str, ...]:
         return tuple(self._tensors)
+
+    @property
+    def storage_dtype(self) -> str:
+        """Configured bank representation (one dtype or checkpoint-native)."""
+        return "source" if self.dtype is None else str(self.dtype)
 
     def tensor(self, name: str) -> torch.Tensor:
         try:
@@ -322,6 +332,11 @@ class ResidentTensorBank:
         materialized = 0
         checkpoint = 0
         for name, span in zip(requested, spans):
+            expected_dtype = (
+                _TORCH_DTYPES[span.dtype]
+                if self.dtype is None
+                else self.dtype
+            )
             tensor = self.loader.read_torch(
                 name, device=self.device, dtype=self.dtype
             )
@@ -332,10 +347,10 @@ class ResidentTensorBank:
                     or tensor.device.index == self.device.index
                 )
             )
-            if not device_matches or tensor.dtype != self.dtype:
+            if not device_matches or tensor.dtype != expected_dtype:
                 raise AssertionError(
                     f"{name}: materialized as {tensor.device}/{tensor.dtype}, "
-                    f"expected {self.device}/{self.dtype}"
+                    f"expected {self.device}/{expected_dtype}"
                 )
             self._tensors[name] = tensor
             checkpoint += span.byte_length
@@ -345,6 +360,7 @@ class ResidentTensorBank:
                 tensor.numel() * tensor.element_size()
             )
         elapsed = time.perf_counter() - started
+        self._load_seconds += elapsed
         return BankLoadReport(
             tensors=len(requested),
             checkpoint_bytes=checkpoint,
@@ -352,7 +368,7 @@ class ResidentTensorBank:
             read_transfer_seconds=elapsed,
             total_seconds=elapsed,
             device=str(self.device),
-            dtype=str(self.dtype),
+            dtype=self.storage_dtype,
         )
 
     def bind_module(self, module: nn.Module, prefix: str) -> int:
@@ -377,6 +393,7 @@ class ResidentTensorBank:
         self._tensors.clear()
         self._checkpoint_bytes = 0
         self._materialized_bytes = 0
+        self._load_seconds = 0.0
         return count, materialized
 
 
@@ -407,7 +424,7 @@ def runtime_bank() -> ResidentTensorBank | None:
 def build_runtime_bank(
     *,
     device: torch.device | str,
-    dtype: torch.dtype,
+    dtype: torch.dtype | None,
     layers_per_stage: int = 8,
     progress=None,
 ) -> ResidentTensorBank:

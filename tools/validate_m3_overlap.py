@@ -13,6 +13,7 @@ import pathlib
 import subprocess
 import sys
 import time
+from collections import Counter
 from typing import Any
 
 import torch
@@ -54,6 +55,22 @@ def parse_args(argv=None):
         "--darwin-nocache",
         action="store_true",
         help="enable F_NOCACHE after validating the normal M3 profile",
+    )
+    parser.add_argument(
+        "--resident-bank-dtype",
+        choices=("runtime", "source"),
+        default="runtime",
+        help="permanent resident representation; source preserves checkpoint dtype",
+    )
+    parser.add_argument(
+        "--pin-layers",
+        type=int,
+        help="override K3_PIN_LAYERS after validating the base profile",
+    )
+    parser.add_argument(
+        "--oracle-evidence",
+        type=pathlib.Path,
+        help="require token, route, and FP32-logit hashes to match saved evidence",
     )
     parser.add_argument(
         "--output",
@@ -163,6 +180,18 @@ def run_sequence(
         )
         torch.mps.synchronize()
         elapsed = time.perf_counter() - started
+        layer_owned = sum(
+            parameter.device.type != "meta"
+            for layer in layers
+            for parameter in layer.parameters()
+        )
+        if (
+            getattr(kr, "RESIDENT_BANK_DTYPE", "runtime") == "source"
+            and layer_owned
+        ):
+            raise AssertionError(
+                f"source resident run retained {layer_owned} layer tensors"
+            )
         after = memory_snapshot(f"{label}-token-{step}-after")
         cpu_logits = logits.detach().to(torch.float32).cpu()
         output_token = int(cpu_logits[0, -1].argmax())
@@ -185,6 +214,7 @@ def run_sequence(
             "input_token": current_token,
             "output_token": output_token,
             "seconds": elapsed,
+            "layer_runtime_owned_tensors": layer_owned,
             "before": before,
             "after": after,
             "physical_member_read_bytes": physical,
@@ -347,11 +377,63 @@ def aggregate(sequence):
     return result
 
 
+def compare_saved_oracle(candidate, path: pathlib.Path):
+    oracle = json.loads(path.read_text())
+    sequences = oracle.get("sequences", {})
+    for key in ("serial_warm", "serial_first", "overlap_first"):
+        if key in sequences:
+            reference = sequences[key]
+            break
+    else:
+        raise ValueError(f"{path}: no comparable sequence")
+    if len(reference["tokens"]) < len(candidate["tokens"]):
+        raise AssertionError(
+            f"oracle has only {len(reference['tokens'])} tokens, "
+            f"candidate needs {len(candidate['tokens'])}"
+        )
+    rows = []
+    for expected, actual in zip(
+        reference["tokens"][:len(candidate["tokens"])],
+        candidate["tokens"],
+    ):
+        row = {
+            "step": actual["step"],
+            "input_token_exact": (
+                expected["input_token"] == actual["input_token"]
+            ),
+            "output_token_exact": (
+                expected["output_token"] == actual["output_token"]
+            ),
+            "routes_exact": expected["routes"] == actual["routes"],
+            "logits_sha256_f32_exact": (
+                expected["logits"]["sha256_f32"]
+                == actual["logits"]["sha256_f32"]
+            ),
+        }
+        row["passed"] = all(
+            value for key, value in row.items() if key.endswith("_exact")
+        )
+        if not row["passed"]:
+            raise AssertionError(f"saved-oracle parity failed: {row}")
+        rows.append(row)
+    return {
+        "passed": True,
+        "path": str(path.resolve()),
+        "oracle_schema": oracle.get("schema"),
+        "oracle_git_commit": oracle.get("git_commit"),
+        "sequence": key,
+        "tokens": rows,
+    }
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.tokens < 2:
         raise ValueError("--tokens must be at least 2")
     require_profile()
+    os.environ["K3_RESIDENT_BANK_DTYPE"] = args.resident_bank_dtype
+    if args.pin_layers is not None:
+        os.environ["K3_PIN_LAYERS"] = str(args.pin_layers)
     if args.darwin_nocache:
         os.environ["K3_PREAD_NOCACHE"] = "1"
     if os.environ.get("K3_DIRECT_OVERLAP") not in ("0", "1"):
@@ -362,12 +444,16 @@ def main(argv=None) -> int:
     tree_before = model_tree_fingerprint(model_dir)
     evidence: dict[str, Any] = {
         "schema": (
-            "deltafin.m5-cold-gate.v1"
-            if os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY") == "1"
+            "deltafin.m6-source-resident.v1"
+            if args.resident_bank_dtype == "source"
             else (
-                "deltafin.m4-adaptive.v1"
-                if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
-                else "deltafin.m3-overlap.v1"
+                "deltafin.m5-cold-gate.v1"
+                if os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY") == "1"
+                else (
+                    "deltafin.m4-adaptive.v1"
+                    if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
+                    else "deltafin.m3-overlap.v1"
+                )
             )
         ),
         "status": "running",
@@ -379,6 +465,16 @@ def main(argv=None) -> int:
         "tokens": args.tokens,
         "sequence_order": args.sequence_order,
         "darwin_nocache": args.darwin_nocache,
+        "resident_bank_dtype": args.resident_bank_dtype,
+        "pin_layers": (
+            args.pin_layers
+            if args.pin_layers is not None
+            else int(os.environ["K3_PIN_LAYERS"])
+        ),
+        "oracle_evidence": (
+            str(args.oracle_evidence.resolve())
+            if args.oracle_evidence is not None else None
+        ),
         "baseline": baseline,
         "official_tree_before": tree_before,
         "model_files_modified": False,
@@ -407,6 +503,44 @@ def main(argv=None) -> int:
         import direct_shard_loader
         import resident_shard_loader
 
+        bank = resident_shard_loader.runtime_bank()
+        if bank is None:
+            raise AssertionError("runtime resident bank was not built")
+        source_dtype_counts = Counter()
+        source_dtype_bytes = Counter()
+        resident_fp32_bytes = 0
+        for name in bank.names:
+            span = bank.loader.tensor_span(name)
+            source_dtype_counts[span.dtype] += 1
+            source_dtype_bytes[span.dtype] += span.byte_length
+            resident_fp32_bytes += (
+                bank.tensor(name).numel()
+                * torch.empty((), dtype=torch.float32).element_size()
+            )
+        evidence["resident_bank"] = {
+            "storage_dtype": bank.storage_dtype,
+            "tensors": len(bank),
+            "checkpoint_bytes": bank.checkpoint_bytes,
+            "materialized_bytes": bank.materialized_bytes,
+            "load_seconds": bank.load_seconds,
+            "load_gbps": (
+                bank.checkpoint_bytes / bank.load_seconds / 1e9
+                if bank.load_seconds else None
+            ),
+            "source_dtype_tensors": dict(sorted(source_dtype_counts.items())),
+            "source_dtype_bytes": dict(sorted(source_dtype_bytes.items())),
+            "forced_fp32_bytes": resident_fp32_bytes,
+            "bytes_recovered_vs_fp32": (
+                resident_fp32_bytes - bank.materialized_bytes
+            ),
+        }
+        if args.resident_bank_dtype == "source":
+            if bank.storage_dtype != "source":
+                raise AssertionError("source-dtype bank was not selected")
+            if bank.materialized_bytes != bank.checkpoint_bytes:
+                raise AssertionError(
+                    "source-dtype bank materialized size differs from checkpoint"
+                )
         evidence["overlap_configuration"] = {
             "policy": kr.DIRECT_OVERLAP_POLICY,
             "adaptive": (
@@ -485,6 +619,11 @@ def main(argv=None) -> int:
             sequence_logits["serial_warm"],
             sequence_logits["overlap_warm"],
         )
+        if args.oracle_evidence is not None:
+            evidence["saved_oracle_parity"] = compare_saved_oracle(
+                evidence["sequences"]["serial_warm"],
+                args.oracle_evidence,
+            )
         evidence["aggregate"] = {
             name: aggregate(sequence)
             for name, sequence in evidence["sequences"].items()

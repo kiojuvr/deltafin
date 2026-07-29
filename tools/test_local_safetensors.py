@@ -88,7 +88,7 @@ class LocalSafetensorsTests(unittest.TestCase):
         arrays_a = [
             (self.names["a"], np.arange(12, dtype=np.uint8).reshape(3, 4)),
             (self.names["b"], np.arange(3, dtype=np.uint8)),
-            (self.names["gap"], np.array([123.5], dtype=np.float32)),
+            (self.names["gap"], np.array([123], dtype=np.uint8)),
             (self.names["c"], np.arange(8, dtype=np.uint8).reshape(2, 4)),
             (self.names["c_scale"], np.array([6, 7], dtype=np.uint8)),
             (self.names["c_w3"], np.arange(6, dtype=np.uint8).reshape(2, 3)),
@@ -273,6 +273,27 @@ class LocalSafetensorsTests(unittest.TestCase):
                 bank.tensor("resident.missing")
             self.assertEqual(bank.release(), (2, 13 * 4))
             self.assertEqual(len(bank), 0)
+
+    def test_resident_tensor_bank_preserves_source_dtypes(self):
+        import torch
+
+        with LocalSafetensorsStore(self.root) as store:
+            loader = DirectResidentLoader(store)
+            bank = ResidentTensorBank(loader, device="cpu", dtype=None)
+            report = bank.load_names(
+                [self.names["gap"], "resident.matrix"]
+            )
+            self.assertEqual(report.dtype, "source")
+            self.assertEqual(bank.storage_dtype, "source")
+            self.assertEqual(bank.tensor(self.names["gap"]).dtype, torch.uint8)
+            self.assertEqual(bank.tensor("resident.matrix").dtype, torch.float32)
+            expected_bytes = (
+                store.tensor_span(self.names["gap"]).byte_length
+                + store.tensor_span("resident.matrix").byte_length
+            )
+            self.assertEqual(report.checkpoint_bytes, expected_bytes)
+            self.assertEqual(report.materialized_bytes, expected_bytes)
+            self.assertEqual(bank.materialized_bytes, expected_bytes)
 
     def test_runtime_resident_bank_reuses_device_storage(self):
         import torch
