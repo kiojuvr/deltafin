@@ -213,6 +213,9 @@ startup. These variables exist for overriding that:
 | `K3_DIRECT_PREFETCH_TOKEN_BUDGET_BYTES` | `4000000000` | hard per-token speculative-read budget for adaptive direct-slab overlap |
 | `K3_DIRECT_PREFETCH_WARMUP` | `64` | rank observations required before adaptive prefetch can issue a read |
 | `K3_DIRECT_PREFETCH_MIN_WILSON_PRECISION` | `0.55` | minimum 95% Wilson precision lower bound for each eligible previous-route rank |
+| `K3_DIRECT_PREFETCH_COLD_ONLY` | `0` | require the actual-route demand-read EMA to indicate a cold layer before adaptive prefetch; see the [M5 cold-gate report](docs/m3ultra512-m5-cold-gate.md) |
+| `K3_DIRECT_PREFETCH_COLD_GBPS` | `5.0` | maximum demand-read EMA bandwidth at which the M5 cold gate opens |
+| `K3_DIRECT_DEMAND_EMA_ALPHA` | `0.25` | layer-to-layer EMA weight for the direct-slab demand bandwidth signal |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |

@@ -156,3 +156,6 @@ M5 should separate cold benefit from warm overhead:
 
 BF16 resident storage remains independent and deferred until the cold adaptive
 policy has a measured end-to-end benefit.
+
+M5 has now added the demand-latency gate and completed the cold-candidate
+crossover. See the [M5 cold-gate report](m3ultra512-m5-cold-gate.md).
