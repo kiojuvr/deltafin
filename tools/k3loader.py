@@ -1,15 +1,64 @@
 """Weight loading for lazy-K3: local resident spine + on-demand HTTP expert fetch with disk cache."""
-import json, os, threading, time, urllib.request, concurrent.futures
+import collections.abc
+import json, os, pathlib, threading, time, urllib.request, concurrent.futures
 import numpy as np
 import torch
 from mxfp4 import dequant_mxfp4
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INV = json.load(open(os.path.join(ROOT, "k3-meta/tensor_inventory_offsets.json")))
+_DIRECT_SHARDS = (
+    os.environ.get("K3_EXPERT_SOURCE") == "direct-shards"
+    or os.environ.get("K3_RESIDENT_SOURCE") == "direct-shards"
+)
+_DIRECT_EXPERTS = (
+    os.environ.get("K3_EXPERT_SOURCE") == "direct-shards"
+)
+
+
+class _DirectInventory(collections.abc.Mapping):
+    """Compatibility view over the header-derived direct-shard inventory."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def __len__(self):
+        return self._store.tensor_count
+
+    def __iter__(self):
+        return iter(self._store._tensors)
+
+    def __getitem__(self, name):
+        span = self._store.tensor_span(name)
+        _size, header_length = self._store._shard_info[span.shard]
+        relative_start = span.offset - 8 - header_length
+        return {
+            "dtype": span.dtype,
+            "shape": list(span.shape),
+            "offsets": [
+                relative_start,
+                relative_start + span.byte_length,
+            ],
+            "shard": span.shard,
+            "hlen": header_length,
+        }
+
+
+def _load_inventory():
+    legacy = pathlib.Path(ROOT) / "k3-meta/tensor_inventory_offsets.json"
+    if not _DIRECT_SHARDS:
+        with legacy.open() as stream:
+            return json.load(stream)
+    import direct_shard_loader
+
+    return _DirectInventory(direct_shard_loader.store())
+
+
+INV = _load_inventory()
 BASE = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main/"
 RES = os.path.join(ROOT, "k3-resident/tensors")
 ECACHE = os.path.join(ROOT, "k3-experts")
-os.makedirs(ECACHE, exist_ok=True)
+if not _DIRECT_EXPERTS:
+    os.makedirs(ECACHE, exist_ok=True)
 
 _DT = {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "U8": torch.uint8}
 
@@ -40,7 +89,10 @@ def _initial_cache_totals():
     return files, experts, sum(files.values())
 
 
-_cache_file_sizes, _cache_experts, _cache_bytes = _initial_cache_totals()
+if _DIRECT_EXPERTS:
+    _cache_file_sizes, _cache_experts, _cache_bytes = {}, set(), 0
+else:
+    _cache_file_sizes, _cache_experts, _cache_bytes = _initial_cache_totals()
 
 
 def register_cache_file(path):

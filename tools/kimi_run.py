@@ -27,18 +27,17 @@ TORCH_THREADS = int(os.environ.get("K3_TORCH_THREADS", "8"))
 torch.set_num_threads(TORCH_THREADS)
 
 import k3loader  # noqa: E402
-import importlib  # noqa: E402
+import k3_official  # noqa: E402
 import apple_silicon  # noqa: E402
 import runtime_platform  # noqa: E402
 
-from k3pkg import modeling_kimi_linear as ml
-
-CFG_JSON = json.load(open(os.path.join(ROOT, "k3-meta/config.json")))["text_config"]
-Cfg = getattr(ml, "KimiLinearConfig", None)
-if Cfg is None:
-    Cfg = importlib.import_module("k3pkg.configuration_kimi_k3").KimiLinearConfig
-config = Cfg(**CFG_JSON)
-config._attn_implementation = "eager"
+ml, config, K3_METADATA_DIR = k3_official.load_runtime(ROOT)
+if k3_official.direct_local_requested():
+    print(
+        f"[config] metadata/tokenizer source: official local "
+        f"{K3_METADATA_DIR}",
+        flush=True,
+    )
 BASE_MOE_TOP_K = int(config.num_experts_per_token)
 MOE_TOP_K = int(os.environ.get("K3_MOE_TOP_K", BASE_MOE_TOP_K))
 if not 1 <= MOE_TOP_K <= BASE_MOE_TOP_K:
@@ -235,12 +234,20 @@ class RouterTrace:
             self._f = None
 
 
-TRACE = RouterTrace(os.path.join(ROOT, "k3-meta/router_trace.jsonl"),
-                    os.environ.get("K3_TRACE", "off"))
+_TRACE_DEFAULT = (
+    os.path.join(ROOT, "bench-results/router_trace.jsonl")
+    if k3_official.direct_local_requested()
+    else os.path.join(ROOT, "k3-meta/router_trace.jsonl")
+)
+TRACE = RouterTrace(
+    os.environ.get("K3_TRACE_PATH", _TRACE_DEFAULT),
+    os.environ.get("K3_TRACE", "off"),
+)
 TIMES = {"resident_io": 0.0, "expert_fetch": 0.0, "compute": 0.0, "moe_kernel": 0.0,
          "preload_wait": 0.0}   # time the main thread blocks on the preloader
 PROFILE = os.environ.get("K3_PROFILE", "0") == "1"
 PROF = {"kda": 0.0, "mla": 0.0, "n_kda": 0, "n_mla": 0}
+LAYER_PROFILE = []
 EVENT_SCHEMA = "deltafin.run_event.v1"
 
 
@@ -1357,6 +1364,7 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
            if PRELOAD and nxt < NL else None)
     for i, layer in enumerate(layers):
         _step_ctx["layer"] = i
+        layer_phase_before = dict(TIMES) if PROFILE else None
         if TEMPLATES:
             layer.layer_idx = i
             layer.self_attn.layer_idx = i
@@ -1395,6 +1403,34 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
             k = "kda" if layer.is_linear_attn else "mla"
             PROF[k] += dt_layer
             PROF["n_" + k] += 1
+            LAYER_PROFILE.append(
+                {
+                    "step": step,
+                    "layer": i,
+                    "kind": k,
+                    "layer_wall_seconds": dt_layer,
+                    "resident_io_seconds": (
+                        TIMES["resident_io"]
+                        - layer_phase_before["resident_io"]
+                    ),
+                    "expert_read_seconds": (
+                        TIMES["expert_fetch"]
+                        - layer_phase_before["expert_fetch"]
+                    ),
+                    "moe_kernel_seconds": (
+                        TIMES["moe_kernel"]
+                        - layer_phase_before["moe_kernel"]
+                    ),
+                    "non_expert_read_seconds": max(
+                        0.0,
+                        dt_layer
+                        - (
+                            TIMES["expert_fetch"]
+                            - layer_phase_before["expert_fetch"]
+                        ),
+                    ),
+                }
+            )
         if not TEMPLATES and not (i < PIN_N):
             dematerialize(layer)
         if verbose and (i % 10 == 0 or i == NL - 1):
@@ -1649,6 +1685,12 @@ EXPERT_SPAN = 17547264
 def check_expert_pool():
     """Streaming is the fallback, not the goal. Warn clearly when the expert pool
     isn't fully local, because every novel prompt pays for it over the network."""
+    if EXPERT_SOURCE == "direct-shards":
+        print(
+            f"[experts] official local shards: {direct_shard_loader.MODEL_DIR}",
+            flush=True,
+        )
+        return
     import shutil
     n, _ = k3loader.cache_totals()
     if n >= TOTAL_EXPERTS:
@@ -1694,8 +1736,7 @@ def main():
     args = ap.parse_args()
     events = EventLog(args.events_jsonl)
 
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "k3-meta"), trust_remote_code=True)
+    tok = k3_official.load_tokenizer(ROOT)
     if args.chat:
         ids = tok.apply_chat_template([{"role": "user", "content": args.prompt}],
                                       tokenize=True, add_generation_prompt=True)
