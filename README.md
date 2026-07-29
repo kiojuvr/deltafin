@@ -207,6 +207,7 @@ startup. These variables exist for overriding that:
 | `K3_RESIDENT_BANK` | `0` | materialize the complete direct-shard resident inventory once and alias streamed layer parameters to that MPS storage; enabled by the 512 GB profile |
 | `K3_PREAD_NOCACHE` | `0` | normal direct-shard runtime uses buffered positional I/O and macOS page cache; `1` is a measurement control and does not purge pages already in RAM |
 | `K3_DIRECT_SLAB` | `0` | lease one of two reusable page-aligned 16-expert banks through synchronous CPU/Metal MoE compute; enabled by the M3 Ultra profile |
+| `K3_DIRECT_OVERLAP` | `0` | experimental previous-token route overlap for direct slabs; bitwise exact but kept off because the measured 19.5% reuse rate regressed warm decode; see the [M3 overlap report](docs/m3ultra512-m3-overlap.md) |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |

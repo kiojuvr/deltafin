@@ -116,8 +116,8 @@ time fingerprints. No official file was written, converted, or copied.
 ## Current bottleneck and next step
 
 Cold expert I/O is now the dominant term: 29.86 seconds versus about 3.24
-seconds of warm non-expert-read layer time. The next performance experiment
-should retain this exact serial result as the oracle and measure:
+seconds of warm non-expert-read layer time. M3 retained this exact serial
+result as the oracle and measured:
 
 1. multiple consecutive decode tokens with physical bytes and cache hits per
    token;
@@ -126,5 +126,8 @@ should retain this exact serial result as the oracle and measure:
 4. routing locality and page-cache survival under the actual resident working
    set.
 
-BF16 resident storage remains deferred until the overlapped float32 path is
-exact.
+The overlap path is bitwise exact, but the previous-token route reused only
+19.46% of slots and regressed the measured warm sequence, so it remains
+disabled by default. See the [M3 multi-token and overlap
+report](m3ultra512-m3-overlap.md). BF16 resident storage remains deferred
+while a higher-confidence, byte-budgeted prefetch policy is evaluated.
