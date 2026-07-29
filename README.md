@@ -201,6 +201,7 @@ startup. These variables exist for overriding that:
 |---|---|---|
 | `K3_DEV` | auto | `mps` when available, then `cuda`, otherwise `cpu`; accepts explicit `mps`, `cuda`, `cuda:N` or `cpu` |
 | `K3_MOE` | auto | `metal` when the selected device is MPS and the library is available; `cpu` elsewhere |
+| `K3_MODEL_DIR` | unset | official local Kimi-K3 directory; direct-shard mode reads its metadata, tokenizer, modeling code, index, and weights in place without creating `k3-meta`; see the [serial-token parity report](docs/m3ultra512-m2-serial-token.md) |
 | `K3_EXPERT_SOURCE` | `cache-http` | `direct-shards` reads routed experts with positional I/O from an unmodified local official checkpoint; see [the M3 Ultra direct-shard report](docs/m3ultra512-direct-shards.md) |
 | `K3_RESIDENT_SOURCE` | `cache-http` | `direct-shards` reads non-routed tensors from the same unmodified checkpoint; see the [complete MPS resident report](docs/m3ultra512-m1d-resident.md) |
 | `K3_RESIDENT_BANK` | `0` | materialize the complete direct-shard resident inventory once and alias streamed layer parameters to that MPS storage; enabled by the 512 GB profile |

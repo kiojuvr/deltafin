@@ -167,7 +167,9 @@ wraps and zero copies, both matched the CPU kernel, and bank A retained the same
 addresses when reused for layer 92. The retained evidence is
 `bench-results/direct-slab-adapter.json`.
 
-The next correctness milestone is an overlap-disabled serial one-token run
-using the ordinary resident-bank and direct-slab runtime, followed by final
-logit/token parity against the established Deltafin path. Only after that
-baseline is exact should next-layer overlap or BF16 resident storage be enabled.
+The overlap-disabled serial one-token milestone is now complete. See the
+[M2 serial-token report](m3ultra512-m2-serial-token.md): the ordinary direct
+runtime and a standard safetensors expert reader produced identical routes and
+bitwise-identical final logits. The next experiment is multi-token
+page-cache accounting followed by next-layer read/compute overlap. BF16
+resident storage remains deferred until the overlapped float32 path is exact.
