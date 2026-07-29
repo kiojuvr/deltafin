@@ -151,3 +151,5 @@ The next phase should retain serial direct-shards as the default oracle and:
 
 The implemented overlap mechanism is ready for those experiments; M3 shows
 that unconditional previous-route speculation is not the policy to ship.
+M4 has now implemented and measured the confidence-gated version; see the
+[adaptive prefetch report](m3ultra512-m4-adaptive-prefetch.md).

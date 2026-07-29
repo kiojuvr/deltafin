@@ -208,6 +208,11 @@ startup. These variables exist for overriding that:
 | `K3_PREAD_NOCACHE` | `0` | normal direct-shard runtime uses buffered positional I/O and macOS page cache; `1` is a measurement control and does not purge pages already in RAM |
 | `K3_DIRECT_SLAB` | `0` | lease one of two reusable page-aligned 16-expert banks through synchronous CPU/Metal MoE compute; enabled by the M3 Ultra profile |
 | `K3_DIRECT_OVERLAP` | `0` | experimental previous-token route overlap for direct slabs; bitwise exact but kept off because the measured 19.5% reuse rate regressed warm decode; see the [M3 overlap report](docs/m3ultra512-m3-overlap.md) |
+| `K3_DIRECT_OVERLAP_POLICY` | `full` | `adaptive` ranks the previous route by router weight and reads only ranks whose learned Wilson precision clears the threshold; still experimental and default-off; see the [M4 adaptive report](docs/m3ultra512-m4-adaptive-prefetch.md) |
+| `K3_DIRECT_PREFETCH_MAX_EXPERTS` | `4` | maximum previous-route candidates per layer under the adaptive direct-slab policy |
+| `K3_DIRECT_PREFETCH_TOKEN_BUDGET_BYTES` | `4000000000` | hard per-token speculative-read budget for adaptive direct-slab overlap |
+| `K3_DIRECT_PREFETCH_WARMUP` | `64` | rank observations required before adaptive prefetch can issue a read |
+| `K3_DIRECT_PREFETCH_MIN_WILSON_PRECISION` | `0.55` | minimum 95% Wilson precision lower bound for each eligible previous-route rank |
 | `K3_GEMV_LIB` / `K3_BATCH_LIB` | platform default | override the native MXFP4 library paths (`.dylib` on macOS, `.so` on Linux) |
 | `K3_SPINE` | auto | `int8` when built (recommended), else `bf16` |
 | `K3_INT8_LM_HEAD` | `1` | packed MPS int8 output head on supported Apple systems; exact dense fallback remains available |
