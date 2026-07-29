@@ -727,11 +727,23 @@ if MOE_BACKEND == "cpu" and CPU_BATCH_ACTIVE:
           f"({fast_moe_batch.pool_threads()} threads)", flush=True)
 
 fetch_v2 = None
-if os.environ.get("K3_FETCH", "v2") == "v2":
+EXPERT_SOURCE = os.environ.get("K3_EXPERT_SOURCE", "cache-http")
+if EXPERT_SOURCE == "direct-shards":
+    import direct_shard_loader
+    k3loader.fetch_experts = direct_shard_loader.fetch_experts
+    k3loader.set_runtime_stats(direct_shard_loader.stats)
+    print(f"[config] expert source: direct official shards "
+          f"({direct_shard_loader.MODEL_DIR})", flush=True)
+elif EXPERT_SOURCE == "cache-http" and os.environ.get("K3_FETCH", "v2") == "v2":
     import fetch_v2
     k3loader.fetch_experts = fetch_v2.fetch_experts  # 6.4x: coalesced + keep-alive
     fetch_v2.set_cache_observer(k3loader.register_cache_file)
     k3loader.set_runtime_stats(fetch_v2.stats)
+elif EXPERT_SOURCE != "cache-http":
+    raise ValueError(
+        "K3_EXPERT_SOURCE must be cache-http or direct-shards, "
+        f"got {EXPERT_SOURCE!r}"
+    )
 
 # K3_EXPERT_READ=pread (see tools/fetch_v2.py) reads the layer's whole selected
 # set through a threaded pread pool instead of demand-faulting mmap pages inside
