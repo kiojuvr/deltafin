@@ -813,6 +813,8 @@ if grouped_moe.enabled():
 
 _LAST_SEL = {}   # layer -> ids selected for the most recent token (prefetch oracle)
 _PREV_SEL = {}   # snapshot of _LAST_SEL taken when the current pass started
+_LAST_ROUTE_RANK = {}
+_PREV_ROUTE_RANK = {}
 DIRECT_SLAB_ACTIVE = (
     EXPERT_SOURCE == "direct-shards"
     and FAST_MOE
@@ -821,11 +823,43 @@ DIRECT_SLAB_ACTIVE = (
 DIRECT_OVERLAP_ACTIVE = (
     DIRECT_SLAB_ACTIVE and direct_shard_loader.overlap_enabled()
 )
+DIRECT_OVERLAP_POLICY = os.environ.get(
+    "K3_DIRECT_OVERLAP_POLICY", "full"
+)
+if DIRECT_OVERLAP_POLICY not in ("full", "adaptive"):
+    raise ValueError(
+        "K3_DIRECT_OVERLAP_POLICY must be full or adaptive"
+    )
+if DIRECT_OVERLAP_POLICY == "adaptive":
+    from adaptive_prefetch import AdaptiveRoutePrefetch
+
+    DIRECT_ADAPTIVE_POLICY = AdaptiveRoutePrefetch(
+        max_experts_per_layer=int(
+            os.environ.get("K3_DIRECT_PREFETCH_MAX_EXPERTS", "4")
+        ),
+        expert_bytes=17_547_264,
+        token_budget_bytes=int(
+            os.environ.get(
+                "K3_DIRECT_PREFETCH_TOKEN_BUDGET_BYTES", "4000000000"
+            )
+        ),
+        warmup_observations=int(
+            os.environ.get("K3_DIRECT_PREFETCH_WARMUP", "64")
+        ),
+        min_wilson_precision=float(
+            os.environ.get(
+                "K3_DIRECT_PREFETCH_MIN_WILSON_PRECISION", "0.55"
+            )
+        ),
+    )
+else:
+    DIRECT_ADAPTIVE_POLICY = None
 if DIRECT_SLAB_ACTIVE:
     print("[config] direct expert source: reusable 16x2 aligned slabs", flush=True)
 if DIRECT_OVERLAP_ACTIVE:
     print(
-        "[config] direct slab overlap: previous-token route, "
+        "[config] direct slab overlap: "
+        f"{DIRECT_OVERLAP_POLICY} previous-token route, "
         "same-layer slot reuse",
         flush=True,
     )
@@ -894,6 +928,20 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
     EXPERT_SEL["uniq"] += len(ids)
     EXPERT_SEL["pos"] += len(rows)
     _LAST_SEL[li] = ids
+    if DIRECT_ADAPTIVE_POLICY is not None:
+        weights = (
+            routing_record["weights"]
+            if routing_record is not None
+            else topk_weight.to(torch.float32).tolist()
+        )
+        scores = {}
+        for expert_row, weight_row in zip(rows, weights):
+            for expert, weight in zip(expert_row, weight_row):
+                scores[expert] = max(scores.get(expert, float("-inf")), weight)
+        _LAST_ROUTE_RANK[li] = tuple(
+            sorted(scores, key=scores.__getitem__, reverse=True)
+        )
+        DIRECT_ADAPTIVE_POLICY.observe(li, ids)
     if pilot.enabled():
         pilot.on_actual(li, rows)               # score the prediction made at li-1
     if GROUPED_MOE_ACTIVE:
@@ -1345,10 +1393,13 @@ def causal_mask(T, past=0, dtype=None):
 
 def forward_pass(layers, cache, hidden, step, verbose=True):
     """hidden: [1, T, H] fp32. Returns logits [1, T, vocab]."""
-    global _PREV_SEL
+    global _PREV_SEL, _PREV_ROUTE_RANK
     T = hidden.shape[1]
     if DIRECT_OVERLAP_ACTIVE:
         _PREV_SEL = dict(_LAST_SEL)
+        _PREV_ROUTE_RANK = dict(_LAST_ROUTE_RANK)
+        if DIRECT_ADAPTIVE_POLICY is not None:
+            DIRECT_ADAPTIVE_POLICY.begin_pass(_PREV_ROUTE_RANK)
         direct_shard_loader.begin_slab_pass()
     if pilot.PILOT:
         pilot.init(config, DEV, _pilot_load, PFX,
@@ -1377,9 +1428,12 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
     for i, layer in enumerate(layers):
         _step_ctx["layer"] = i
         layer_phase_before = dict(TIMES) if PROFILE else None
-        if DIRECT_OVERLAP_ACTIVE and i + 1 < NL:
-            predicted = _PREV_SEL.get(i + 1)
-            if predicted:
+        if DIRECT_OVERLAP_ACTIVE and T == 1 and i + 1 < NL:
+            if DIRECT_ADAPTIVE_POLICY is None:
+                predicted = _PREV_SEL.get(i + 1, ())
+            else:
+                predicted = DIRECT_ADAPTIVE_POLICY.predict(i + 1)
+            if predicted and len(predicted) <= 16:
                 direct_shard_loader.prefetch_slab(i + 1, predicted)
         if TEMPLATES:
             layer.layer_idx = i

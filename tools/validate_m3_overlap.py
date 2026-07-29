@@ -120,6 +120,12 @@ def run_sequence(
     reset_runtime_counters(kr, direct_shard_loader)
     kr._LAST_SEL.clear()
     kr._PREV_SEL.clear()
+    if hasattr(kr, "_LAST_ROUTE_RANK"):
+        kr._LAST_ROUTE_RANK.clear()
+        kr._PREV_ROUTE_RANK.clear()
+    adaptive_policy = getattr(kr, "DIRECT_ADAPTIVE_POLICY", None)
+    if adaptive_policy is not None:
+        adaptive_policy.reset()
     cache = kr.ml.KimiDynamicCache(kr.config)
     embed = kr.LazyEmbed()
     current_token = token_id
@@ -129,6 +135,10 @@ def run_sequence(
     sequence_started = time.perf_counter()
     sequence_before = memory_snapshot(f"{label}-before")
     for step in range(tokens):
+        policy_before = (
+            adaptive_policy.snapshot()
+            if adaptive_policy is not None else None
+        )
         stats_before = dict(direct_shard_loader.stats)
         times_before = dict(kr.TIMES)
         profile_start = len(kr.LAYER_PROFILE)
@@ -146,6 +156,10 @@ def run_sequence(
         output_token = int(cpu_logits[0, -1].argmax())
         routes = routes_snapshot(kr)
         local = locality(routes, previous_routes)
+        policy_after = (
+            adaptive_policy.snapshot()
+            if adaptive_policy is not None else None
+        )
         stats_delta = numeric_delta(
             direct_shard_loader.stats, stats_before
         )
@@ -170,6 +184,7 @@ def run_sequence(
             "phase_seconds": phase_delta,
             "direct_stats": stats_delta,
             "locality_vs_previous_token": local,
+            "adaptive_policy": policy_after,
             "routes": routes,
             "logits": logits_summary(cpu_logits),
             "layer_profile": copy.deepcopy(
@@ -186,12 +201,46 @@ def run_sequence(
         ):
             raise AssertionError("serial token direct-read totals differ")
         if overlap and step > 0:
-            if stats_delta["overlap_layers"] != kr.NL - 1:
-                raise AssertionError("not every routed layer consumed a prefetch")
-            if stats_delta["overlap_hits"] != local["hits"]:
-                raise AssertionError("slab reuse differs from route intersection")
-            if stats_delta["overlap_misses"] != local["misses"]:
-                raise AssertionError("slab misses differ from route intersection")
+            if kr.DIRECT_OVERLAP_POLICY == "full":
+                if stats_delta["overlap_layers"] != kr.NL - 1:
+                    raise AssertionError(
+                        "not every routed layer consumed a prefetch"
+                    )
+                if stats_delta["overlap_hits"] != local["hits"]:
+                    raise AssertionError(
+                        "slab reuse differs from route intersection"
+                    )
+                if stats_delta["overlap_misses"] != local["misses"]:
+                    raise AssertionError(
+                        "slab misses differ from route intersection"
+                    )
+            else:
+                predicted_hits = (
+                    policy_after["predicted_hits"]
+                    - policy_before["predicted_hits"]
+                )
+                predicted_experts = (
+                    policy_after["predicted_experts"]
+                    - policy_before["predicted_experts"]
+                )
+                if stats_delta["overlap_hits"] != predicted_hits:
+                    raise AssertionError(
+                        "adaptive slab hits differ from policy hits"
+                    )
+                if (
+                    stats_delta["overlap_prefetch_experts"]
+                    != predicted_experts
+                ):
+                    raise AssertionError(
+                        "adaptive reads differ from policy predictions"
+                    )
+                if (
+                    stats_delta["overlap_layers"]
+                    != stats_delta["overlap_prefetches"]
+                ):
+                    raise AssertionError(
+                        "not every adaptive prefetch was consumed"
+                    )
         rows.append(row)
         retained_logits.append(cpu_logits)
         progress(label, row)
@@ -203,6 +252,7 @@ def run_sequence(
     result = {
         "label": label,
         "overlap": overlap,
+        "overlap_policy": kr.DIRECT_OVERLAP_POLICY,
         "seconds": time.perf_counter() - sequence_started,
         "before": sequence_before,
         "after": sequence_after,
@@ -251,7 +301,7 @@ def compare_sequences(reference, candidate, ref_logits, candidate_logits):
 
 def aggregate(sequence):
     rows = sequence["tokens"]
-    return {
+    result = {
         "tokens": len(rows),
         "wall_seconds": sum(row["seconds"] for row in rows),
         "physical_member_read_bytes": sum(
@@ -276,6 +326,10 @@ def aggregate(sequence):
             row["locality_vs_previous_token"]["misses"] for row in rows[1:]
         ),
     }
+    policy = rows[-1].get("adaptive_policy") if rows else None
+    if policy is not None:
+        result["adaptive_policy"] = policy
+    return result
 
 
 def main(argv=None) -> int:
@@ -290,7 +344,11 @@ def main(argv=None) -> int:
     model_dir = pathlib.Path(os.environ["K3_MODEL_DIR"]).resolve()
     tree_before = model_tree_fingerprint(model_dir)
     evidence: dict[str, Any] = {
-        "schema": "deltafin.m3-overlap.v1",
+        "schema": (
+            "deltafin.m4-adaptive.v1"
+            if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
+            else "deltafin.m3-overlap.v1"
+        ),
         "status": "running",
         "created_at": now(),
         "git_commit": subprocess.check_output(
@@ -326,6 +384,26 @@ def main(argv=None) -> int:
         import direct_shard_loader
         import resident_shard_loader
 
+        evidence["overlap_configuration"] = {
+            "policy": kr.DIRECT_OVERLAP_POLICY,
+            "adaptive": (
+                {
+                    "max_experts_per_layer": (
+                        kr.DIRECT_ADAPTIVE_POLICY.max_experts_per_layer
+                    ),
+                    "token_budget_bytes": (
+                        kr.DIRECT_ADAPTIVE_POLICY.token_budget_bytes
+                    ),
+                    "warmup_observations": (
+                        kr.DIRECT_ADAPTIVE_POLICY.warmup_observations
+                    ),
+                    "min_wilson_precision": (
+                        kr.DIRECT_ADAPTIVE_POLICY.min_wilson_precision
+                    ),
+                }
+                if kr.DIRECT_ADAPTIVE_POLICY is not None else None
+            ),
+        }
         store = direct_shard_loader.store()
         source_before = model_fingerprint(store)
         evidence["source_before"] = source_before
