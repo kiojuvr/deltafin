@@ -64,6 +64,7 @@ tools/libmxfp4gemv.dylib
 *.o
 
 # --- environments & tooling ---------------------------------
+.venv/
 venv/
 __pycache__/
 *.pyc
