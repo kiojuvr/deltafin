@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,17 +52,76 @@ _tok = None
 _layers = None
 _embed = None
 _memo = DeterministicResponseMemo(RESPONSE_MEMO_ENTRIES)
+_request_metrics = None
+
+
+def _configure_request_metrics():
+    global _request_metrics
+    path = os.environ.get("K3_SERVER_METRICS_JSONL")
+    if not path:
+        return
+    from long_lived_metrics import LongLivedRequestMetrics
+    from validate_m1d_resident import memory_snapshot
+
+    loader = getattr(kr, "direct_shard_loader", None)
+
+    def stats():
+        return dict(loader.stats) if loader is not None else {}
+
+    def routes():
+        return {
+            int(layer): [int(expert) for expert in experts]
+            for layer, experts in kr._LAST_SEL.items()
+        }
+
+    _request_metrics = LongLivedRequestMetrics(
+        Path(path),
+        snapshot=lambda label: memory_snapshot(label),
+        stats=stats,
+        routes=routes,
+        expert_bytes=17_547_264,
+    )
+    print(f"[serve] request metrics: {Path(path).expanduser()}", flush=True)
+
+
+def _metric_begin(rid, mode, ids, max_new, memo_hit):
+    if _request_metrics is None:
+        return None
+    try:
+        return _request_metrics.begin(
+            request_id=rid,
+            mode=mode,
+            input_tokens=len(ids),
+            max_new_tokens=max_new,
+            memo_hit=memo_hit,
+        )
+    except Exception as exc:
+        print(f"[serve] metrics begin failed: {exc!r}", flush=True)
+        return None
+
+
+def _metric_finish(session, status, output_tokens=0, error=None):
+    if session is None or _request_metrics is None:
+        return
+    try:
+        _request_metrics.finish(
+            session,
+            status=status,
+            output_tokens=output_tokens,
+            error=error,
+        )
+    except Exception as exc:
+        print(f"[serve] metrics finish failed: {exc!r}", flush=True)
 
 
 def _boot():
     global _tok, _layers, _embed
-    from transformers import AutoTokenizer
     print("[serve] loading tokenizer + layer skeletons...", flush=True)
-    _tok = AutoTokenizer.from_pretrained(
-        os.path.join(kr.ROOT, "k3-meta"), trust_remote_code=True)
+    _tok = kr.k3_official.load_tokenizer(kr.ROOT)
     kr.check_expert_pool()
     _layers = kr.build_layers()
     _embed = kr.LazyEmbed()
+    _configure_request_metrics()
     print("[serve] ready", flush=True)
 
 
@@ -74,13 +134,18 @@ def _split_reasoning(text):
     return None, text
 
 
-def _gen(ids, max_new, on_delta=None):
+def _gen(ids, max_new, on_delta=None, metric_session=None):
     """Run one generation under the global lock; stream decoded-text deltas."""
     cache = kr.ml.KimiDynamicCache(kr.config)
     toks = []
     decoder = kr.IncrementalTokenDecoder(_tok) if on_delta else None
 
     def on_token(t):
+        if metric_session is not None and _request_metrics is not None:
+            try:
+                _request_metrics.observe_token(metric_session)
+            except Exception as exc:
+                print(f"[serve] metrics token failed: {exc!r}", flush=True)
         if t == kr.EOS_ID:
             return
         toks.append(t)
@@ -164,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             mode = "chat" if chat else "completion"
             cached = _memo.get(mode, ids, max_new)
+            metric_session = _metric_begin(
+                rid, mode, ids, max_new, cached is not None
+            )
             if cached is not None:
                 print(f"[serve] deterministic response memo hit "
                       f"({len(cached.token_ids)} tokens)", flush=True)
@@ -191,7 +259,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 if cached is None:
                     out, text, finish = _gen(
-                        ids, max_new, on_delta=on_delta)
+                        ids,
+                        max_new,
+                        on_delta=on_delta,
+                        metric_session=metric_session,
+                    )
                     _memo.put(mode, ids, max_new, out, text, finish)
                 else:
                     out = list(cached.token_ids)
@@ -199,6 +271,11 @@ class Handler(BaseHTTPRequestHandler):
                     finish = cached.finish_reason
                     if text:
                         on_delta(text)
+                _metric_finish(
+                    metric_session,
+                    "memo-hit" if cached is not None else "ok",
+                    len(out),
+                )
                 key = "delta" if chat else "text"
                 sse({"id": rid, "object": "chat.completion.chunk" if chat else "text_completion",
                      "created": created, "model": MODEL_ID,
@@ -208,12 +285,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if cached is None:
-                out, text, finish = _gen(ids, max_new)
+                out, text, finish = _gen(
+                    ids, max_new, metric_session=metric_session
+                )
                 _memo.put(mode, ids, max_new, out, text, finish)
             else:
                 out = list(cached.token_ids)
                 text = cached.text
                 finish = cached.finish_reason
+            _metric_finish(
+                metric_session,
+                "memo-hit" if cached is not None else "ok",
+                len(out),
+            )
             usage = {"prompt_tokens": len(ids), "completion_tokens": len(out),
                      "total_tokens": len(ids) + len(out)}
             if chat:
@@ -231,8 +315,19 @@ class Handler(BaseHTTPRequestHandler):
                                  "choices": [{"index": 0, "text": text,
                                               "finish_reason": finish}]})
         except BrokenPipeError:
+            _metric_finish(
+                locals().get("metric_session"),
+                "client-disconnected",
+                len(locals().get("out", ())),
+            )
             print("[serve] client disconnected mid-generation", flush=True)
         except Exception as e:
+            _metric_finish(
+                locals().get("metric_session"),
+                "error",
+                len(locals().get("out", ())),
+                repr(e),
+            )
             print(f"[serve] error: {e!r}", flush=True)
             try:
                 self._err(500, str(e))
