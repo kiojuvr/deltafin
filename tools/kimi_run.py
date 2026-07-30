@@ -244,7 +244,8 @@ TRACE = RouterTrace(
     os.environ.get("K3_TRACE", "off"),
 )
 TIMES = {"resident_io": 0.0, "expert_fetch": 0.0, "compute": 0.0, "moe_kernel": 0.0,
-         "preload_wait": 0.0}   # time the main thread blocks on the preloader
+         "preload_wait": 0.0,
+         "resident_scratch_wait": 0.0}
 PROFILE = os.environ.get("K3_PROFILE", "0") == "1"
 PROF = {"kda": 0.0, "mla": 0.0, "n_kda": 0, "n_mla": 0}
 LAYER_PROFILE = []
@@ -389,6 +390,18 @@ def _lm_head_forward(hidden):
 
 def materialize_resident(module, prefix):
     t0 = time.time()
+    if (
+        _RESIDENT_SCRATCH_ARENA is not None
+        and prefix.startswith(PFX + "layers.")
+    ):
+        layer = int(prefix[len(PFX + "layers."):].split(".", 1)[0])
+        _RESIDENT_SCRATCH_ARENA.prepare(
+            module,
+            prefix,
+            slot=layer % _RESIDENT_SCRATCH_ARENA.slots,
+        )
+        TIMES["resident_io"] += time.time() - t0
+        return
     missing = []
     for name, p in list(module.named_parameters()):
         if ".experts." in name:
@@ -407,7 +420,14 @@ def materialize_resident(module, prefix):
         raise RuntimeError(f"missing resident tensors: {missing[:5]}")
 
 
-def dematerialize(module):
+def dematerialize(module, prefix=None):
+    if (
+        _RESIDENT_SCRATCH_ARENA is not None
+        and prefix is not None
+        and prefix.startswith(PFX + "layers.")
+    ):
+        _RESIDENT_SCRATCH_ARENA.unbind_prepared(module, prefix)
+        return
     for name, p in list(module.named_parameters()):
         if p.device.type != "meta":
             set_param(module, name, torch.empty_like(p, device="meta"))
@@ -473,6 +493,14 @@ TEMPLATE_ARENA = (
 )
 _TEMPLATE_ARENA_STORAGE = None
 _TEMPLATE_ARENA_INFO = {}
+RESIDENT_SCRATCH = os.environ.get("K3_RESIDENT_SCRATCH", "0") == "1"
+RESIDENT_SCRATCH_OVERLAP = (
+    os.environ.get("K3_RESIDENT_SCRATCH_OVERLAP", "0") == "1"
+)
+RESIDENT_SCRATCH_SLOTS = int(
+    os.environ.get("K3_RESIDENT_SCRATCH_SLOTS", "1")
+)
+_RESIDENT_SCRATCH_ARENA = None
 
 # --- fast resident-spine path (K3_FAST_SPINE=1, default off) ------------------
 # Packed readinto + one H2D per layer + a bit-exact Metal dequant kernel.
@@ -761,6 +789,33 @@ if RESIDENT_BANK_DTYPE not in ("runtime", "source"):
         "K3_RESIDENT_BANK_DTYPE must be runtime or source, "
         f"got {RESIDENT_BANK_DTYPE!r}"
     )
+if RESIDENT_SCRATCH:
+    scratch_errors = []
+    if RESIDENT_SOURCE != "direct-shards":
+        scratch_errors.append("K3_RESIDENT_SOURCE=direct-shards")
+    if os.environ.get("K3_RESIDENT_BANK", "0") != "1":
+        scratch_errors.append("K3_RESIDENT_BANK=1")
+    if RESIDENT_BANK_DTYPE != "source":
+        scratch_errors.append("K3_RESIDENT_BANK_DTYPE=source")
+    if TEMPLATES:
+        scratch_errors.append("K3_TEMPLATES=0")
+    if PIN_N != 0:
+        scratch_errors.append("K3_PIN_LAYERS=0")
+    if QUANT:
+        scratch_errors.append("K3_SPINE=bf16")
+    if DT != torch.float32:
+        scratch_errors.append("K3_DTYPE=fp32")
+    if RESIDENT_SCRATCH_SLOTS < 1:
+        scratch_errors.append("K3_RESIDENT_SCRATCH_SLOTS>=1")
+    if RESIDENT_SCRATCH_OVERLAP and PRELOAD:
+        scratch_errors.append("K3_PRELOAD=0")
+    if RESIDENT_SCRATCH_OVERLAP and RESIDENT_SCRATCH_SLOTS < 2:
+        scratch_errors.append("K3_RESIDENT_SCRATCH_SLOTS>=2 for overlap")
+    if scratch_errors:
+        raise RuntimeError(
+            "K3_RESIDENT_SCRATCH=1 requires: "
+            + ", ".join(scratch_errors)
+        )
 if RESIDENT_SOURCE == "direct-shards":
     import direct_shard_loader
     import resident_shard_loader
@@ -804,6 +859,45 @@ elif RESIDENT_SOURCE != "cache-http":
         "K3_RESIDENT_SOURCE must be cache-http or direct-shards, "
         f"got {RESIDENT_SOURCE!r}"
     )
+
+def resident_scratch_arena():
+    return _RESIDENT_SCRATCH_ARENA
+
+
+def _build_resident_scratch(layers):
+    global _RESIDENT_SCRATCH_ARENA
+    if not RESIDENT_SCRATCH:
+        return None
+    if _RESIDENT_SCRATCH_ARENA is not None:
+        return _RESIDENT_SCRATCH_ARENA
+    bank = resident_shard_loader.runtime_bank()
+    if bank is None:
+        raise RuntimeError("resident scratch requires a runtime resident bank")
+    _RESIDENT_SCRATCH_ARENA = resident_shard_loader.ResidentScratchArena.for_modules(
+        bank,
+        (
+            (layer, f"{PFX}layers.{index}.")
+            for index, layer in enumerate(layers)
+        ),
+        dtype=DT,
+        slots=RESIDENT_SCRATCH_SLOTS,
+    )
+    report = _RESIDENT_SCRATCH_ARENA.snapshot()
+    print(
+        f"[resident-scratch] {report['slots']} fixed slots, "
+        f"{report['slot_bytes']/2**30:.3f} GiB/slot, "
+        f"{report['storage_bytes']/2**30:.3f} GiB total, "
+        f"overlap={int(RESIDENT_SCRATCH_OVERLAP)}",
+        flush=True,
+    )
+    return _RESIDENT_SCRATCH_ARENA
+
+
+def release_resident_scratch():
+    global _RESIDENT_SCRATCH_ARENA
+    arena, _RESIDENT_SCRATCH_ARENA = _RESIDENT_SCRATCH_ARENA, None
+    if arena is not None:
+        arena.release()
 
 # K3_EXPERT_READ=pread (see tools/fetch_v2.py) reads the layer's whole selected
 # set through a threaded pread pool instead of demand-faulting mmap pages inside
@@ -1176,6 +1270,7 @@ def build_layers():
         with torch.device("meta"):
             for i in range(NL):
                 layers.append(ml.KimiDecoderLayer(config, i).eval())
+        _build_resident_scratch(layers)
         return layers
     with torch.device("meta"):
         l0 = ml.KimiDecoderLayer(config, 0).eval()        # dense KDA (unique shape)
@@ -1465,6 +1560,8 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
     nxt = _next_unpinned(0)
     fut = (_PRELOADER.submit(_spine_read, layers[nxt], f"{PFX}layers.{nxt}.")
            if PRELOAD and nxt < NL else None)
+    scratch_fut = None
+    scratch_fut_layer = None
     for i, layer in enumerate(layers):
         _step_ctx["layer"] = i
         layer_phase_before = dict(TIMES) if PROFILE else None
@@ -1490,7 +1587,19 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
             layer.self_attn.layer_idx = i
         pinned = i < PIN_N and getattr(layer, "_k3_res", False)
         if not pinned:
-            if PRELOAD and fut is not None and i == nxt:
+            if (
+                RESIDENT_SCRATCH_OVERLAP
+                and scratch_fut is not None
+                and scratch_fut_layer == i
+            ):
+                wait_started = time.time()
+                scratch_fut.result()
+                TIMES["resident_scratch_wait"] += (
+                    time.time() - wait_started
+                )
+                scratch_fut = None
+                scratch_fut_layer = None
+            elif PRELOAD and fut is not None and i == nxt:
                 _tw = time.time()
                 blobs = fut.result()
                 TIMES["preload_wait"] += time.time() - _tw
@@ -1511,6 +1620,17 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
             pilot.arm(layer)
         if PROFILE and DEV.type in ("mps", "cuda"):
             _device_synchronize()
+        if (
+            RESIDENT_SCRATCH_OVERLAP
+            and not pinned
+            and i + 1 < NL
+        ):
+            scratch_fut_layer = i + 1
+            scratch_fut = _PRELOADER.submit(
+                materialize_resident,
+                layers[i + 1],
+                f"{PFX}layers.{i + 1}.",
+            )
         t0 = time.time()
         hidden, block_residual = layer(
             hidden, attention_mask=mask, position_ids=None,
@@ -1552,7 +1672,7 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
                 }
             )
         if not TEMPLATES and not (i < PIN_N):
-            dematerialize(layer)
+            dematerialize(layer, f"{PFX}layers.{i}.")
         if verbose and (i % 10 == 0 or i == NL - 1):
             print(f"    layer {i:2d}/92 done  (res_io {TIMES['resident_io']:.0f}s "
                   f"exp {TIMES['expert_fetch']:.0f}s comp {TIMES['compute']:.0f}s)",
@@ -1565,7 +1685,9 @@ def forward_pass(layers, cache, hidden, step, verbose=True):
         print(f"[prof] KDA {PROF['kda']:.1f}s/{PROF['n_kda']} MLA {PROF['mla']:.1f}s/{PROF['n_mla']} "
               f"| moe_kernel {mk:.1f}s | fetch {TIMES['expert_fetch']:.1f}s "
               f"| apply {TIMES['resident_io']:.1f}s"
-              f"| preload_wait {TIMES['preload_wait']:.1f}s", flush=True)
+              f"| preload_wait {TIMES['preload_wait']:.1f}s"
+              f"| scratch_wait {TIMES['resident_scratch_wait']:.3f}s",
+              flush=True)
         rep = spine_fast.phase_report()
         if rep:
             print(rep, flush=True)
@@ -1878,6 +2000,9 @@ def main():
             "spine": SPINE,
             "dtype": str(DT),
             "resident_bank_dtype": RESIDENT_BANK_DTYPE,
+            "resident_scratch": RESIDENT_SCRATCH,
+            "resident_scratch_overlap": RESIDENT_SCRATCH_OVERLAP,
+            "resident_scratch_slots": RESIDENT_SCRATCH_SLOTS,
             "approx": APPROX,
             "templates": TEMPLATES,
             "template_arena": bool(_TEMPLATE_ARENA_STORAGE is not None),

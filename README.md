@@ -206,6 +206,9 @@ startup. These variables exist for overriding that:
 | `K3_RESIDENT_SOURCE` | `cache-http` | `direct-shards` reads non-routed tensors from the same unmodified checkpoint; see the [complete MPS resident report](docs/m3ultra512-m1d-resident.md) |
 | `K3_RESIDENT_BANK` | `0` | materialize the complete direct-shard resident inventory once and alias streamed layer parameters to that MPS storage; enabled by the 512 GB profile |
 | `K3_RESIDENT_BANK_DTYPE` | `runtime` | `source` preserves each resident tensor's official checkpoint dtype in the permanent MPS bank, then creates only per-layer runtime-dtype scratch; source mode requires `K3_PIN_LAYERS=0`; see the [M6 source-resident report](docs/m3ultra512-m6-source-resident.md) |
+| `K3_RESIDENT_SCRATCH` | `0` | reuse one fixed FP32 arena for source-dtype layer materialization, including cached views and meta sentinels; requires source bank, BF16 spine, FP32 runtime, templates off, and pin-layers 0; see the [M7 scratch report](docs/m3ultra512-m7-resident-scratch.md) |
+| `K3_RESIDENT_SCRATCH_SLOTS` | `1` | number of fixed FP32 layer arenas; one slot is the selected serial path |
+| `K3_RESIDENT_SCRATCH_OVERLAP` | `0` | prepare layer N+1 on a worker into the alternate slot; requires at least two slots and remains off because it did not beat serial M7 |
 | `K3_PREAD_NOCACHE` | `0` | normal direct-shard runtime uses buffered positional I/O and macOS page cache; `1` is a measurement control and does not purge pages already in RAM |
 | `K3_DIRECT_SLAB` | `0` | lease one of two reusable page-aligned 16-expert banks through synchronous CPU/Metal MoE compute; enabled by the M3 Ultra profile |
 | `K3_DIRECT_OVERLAP` | `0` | experimental previous-token route overlap for direct slabs; bitwise exact but kept off because the measured 19.5% reuse rate regressed warm decode; see the [M3 overlap report](docs/m3ultra512-m3-overlap.md) |

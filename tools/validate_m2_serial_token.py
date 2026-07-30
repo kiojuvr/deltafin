@@ -300,6 +300,8 @@ def cleanup_runtime(kr, direct_shard_loader, resident_shard_loader, layers):
     kr._LM_SC = None
     kr._TAIL = None
     layers.clear()
+    if hasattr(kr, "release_resident_scratch"):
+        kr.release_resident_scratch()
     resident_shard_loader.release_runtime_bank()
     direct_shard_loader.close()
     gc.collect()

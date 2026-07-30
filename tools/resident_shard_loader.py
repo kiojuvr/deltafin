@@ -58,6 +58,27 @@ class BankLoadReport:
     dtype: str
 
 
+@dataclass(frozen=True, slots=True)
+class ScratchTensorPlan:
+    parameter_name: str
+    resident_name: str
+    shape: tuple[int, ...]
+    offset: int
+    elements: int
+    source: torch.Tensor
+    target_module: nn.Module
+    attribute_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchLoadReport:
+    tensors: int
+    source_bytes: int
+    materialized_bytes: int
+    seconds: float
+    slot: int
+
+
 def set_parameter(root: nn.Module, dotted_name: str, tensor: torch.Tensor) -> None:
     target = root
     parts = dotted_name.split(".")
@@ -395,6 +416,311 @@ class ResidentTensorBank:
         self._materialized_bytes = 0
         self._load_seconds = 0.0
         return count, materialized
+
+
+class ResidentScratchArena:
+    """Fixed device storage for streamed runtime-dtype layer parameters.
+
+    The resident bank remains the sole permanent weight owner. A scratch slot
+    holds runtime-dtype views for one executing layer and is safe to reuse once
+    the device work consuming that layer has completed.
+    """
+
+    def __init__(
+        self,
+        bank: ResidentTensorBank,
+        *,
+        capacity_elements: int,
+        dtype: torch.dtype,
+        slots: int = 2,
+        alignment_bytes: int = 256,
+    ):
+        if capacity_elements <= 0:
+            raise ValueError("capacity_elements must be positive")
+        if slots <= 0:
+            raise ValueError("scratch slots must be positive")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        if alignment_bytes <= 0 or alignment_bytes % element_size:
+            raise ValueError(
+                "alignment_bytes must be positive and divisible by element size"
+            )
+        self.bank = bank
+        self.device = bank.device
+        self.dtype = dtype
+        self.capacity_elements = capacity_elements
+        self.alignment_bytes = alignment_bytes
+        self.alignment_elements = alignment_bytes // element_size
+        self._storage = [
+            torch.empty(
+                capacity_elements,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            for _ in range(slots)
+        ]
+        self._locks = [threading.Lock() for _ in self._storage]
+        self._plan_cache: dict[
+            tuple[int, str], tuple[ScratchTensorPlan, ...]
+        ] = {}
+        self._parameter_cache: dict[
+            tuple[int, str, int], tuple[nn.Parameter, ...]
+        ] = {}
+        self._meta_cache: dict[
+            tuple[int, str], tuple[nn.Parameter, ...]
+        ] = {}
+        self._preparations = 0
+        self._prepare_seconds = 0.0
+        self._source_bytes = 0
+        self._materialized_bytes = 0
+
+    @property
+    def slots(self) -> int:
+        return len(self._storage)
+
+    @property
+    def storage_bytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self._storage
+        )
+
+    @property
+    def slot_bytes(self) -> int:
+        return self._storage[0].numel() * self._storage[0].element_size()
+
+    @property
+    def slot_pointers(self) -> tuple[int, ...]:
+        return tuple(tensor.data_ptr() for tensor in self._storage)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "slots": self.slots,
+            "slot_bytes": self.slot_bytes,
+            "storage_bytes": self.storage_bytes,
+            "capacity_elements": self.capacity_elements,
+            "alignment_bytes": self.alignment_bytes,
+            "preparations": self._preparations,
+            "prepare_seconds": self._prepare_seconds,
+            "source_bytes": self._source_bytes,
+            "materialized_bytes": self._materialized_bytes,
+            "device": str(self.device),
+            "dtype": str(self.dtype),
+            "slot_pointers": list(self.slot_pointers),
+        }
+
+    def plan(
+        self,
+        module: nn.Module,
+        prefix: str,
+    ) -> tuple[tuple[ScratchTensorPlan, ...], int]:
+        key = (id(module), prefix)
+        cached = self._plan_cache.get(key)
+        if cached is not None:
+            end = max(
+                plan.offset + plan.elements for plan in cached
+            )
+            end = (
+                (end + self.alignment_elements - 1)
+                // self.alignment_elements
+                * self.alignment_elements
+            )
+            return cached, end
+        offset = 0
+        plans = []
+        for parameter_name, _parameter in module.named_parameters():
+            if ".experts." in parameter_name:
+                continue
+            resident_name = prefix + parameter_name
+            source = self.bank.tensor(resident_name)
+            target_module = module
+            parts = parameter_name.split(".")
+            for part in parts[:-1]:
+                target_module = (
+                    target_module[int(part)]
+                    if part.isdigit()
+                    else getattr(target_module, part)
+                )
+            offset = (
+                (offset + self.alignment_elements - 1)
+                // self.alignment_elements
+                * self.alignment_elements
+            )
+            elements = source.numel()
+            plans.append(
+                ScratchTensorPlan(
+                    parameter_name=parameter_name,
+                    resident_name=resident_name,
+                    shape=tuple(source.shape),
+                    offset=offset,
+                    elements=elements,
+                    source=source,
+                    target_module=target_module,
+                    attribute_name=parts[-1],
+                )
+            )
+            offset += elements
+        offset = (
+            (offset + self.alignment_elements - 1)
+            // self.alignment_elements
+            * self.alignment_elements
+        )
+        if offset > self.capacity_elements:
+            raise ValueError(
+                f"module needs {offset} scratch elements, "
+                f"capacity is {self.capacity_elements}"
+            )
+        result = tuple(plans)
+        self._plan_cache[key] = result
+        self._meta_cache[key] = tuple(
+            nn.Parameter(
+                torch.empty(
+                    plan.shape,
+                    device="meta",
+                    dtype=self.dtype,
+                ),
+                requires_grad=False,
+            )
+            for plan in result
+        )
+        return result, offset
+
+    @classmethod
+    def for_modules(
+        cls,
+        bank: ResidentTensorBank,
+        indexed_modules: Iterable[tuple[nn.Module, str]],
+        *,
+        dtype: torch.dtype,
+        slots: int = 2,
+        alignment_bytes: int = 256,
+    ) -> "ResidentScratchArena":
+        rows = tuple(indexed_modules)
+        if not rows:
+            raise ValueError("at least one module is required")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        if alignment_bytes <= 0 or alignment_bytes % element_size:
+            raise ValueError(
+                "alignment_bytes must be positive and divisible by element size"
+            )
+        align = alignment_bytes // element_size
+        maximum = 0
+        for module, prefix in rows:
+            offset = 0
+            count = 0
+            for parameter_name, _parameter in module.named_parameters():
+                if ".experts." in parameter_name:
+                    continue
+                source = bank.tensor(prefix + parameter_name)
+                offset = (offset + align - 1) // align * align
+                offset += source.numel()
+                count += 1
+            if count == 0:
+                raise ValueError(f"{prefix!r} has no resident parameters")
+            offset = (offset + align - 1) // align * align
+            maximum = max(maximum, offset)
+        arena = cls(
+            bank,
+            capacity_elements=maximum,
+            dtype=dtype,
+            slots=slots,
+            alignment_bytes=alignment_bytes,
+        )
+        for index, (module, prefix) in enumerate(rows):
+            arena.prime(module, prefix, slot=index % slots)
+        return arena
+
+    def prime(self, module: nn.Module, prefix: str, *, slot: int) -> None:
+        if slot < 0 or slot >= self.slots:
+            raise IndexError(f"scratch slot {slot} outside [0,{self.slots})")
+        plans, _elements = self.plan(module, prefix)
+        key = (id(module), prefix, slot)
+        if key not in self._parameter_cache:
+            storage = self._storage[slot]
+            self._parameter_cache[key] = tuple(
+                nn.Parameter(
+                    storage[
+                        plan.offset:plan.offset + plan.elements
+                    ].view(plan.shape),
+                    requires_grad=False,
+                )
+                for plan in plans
+            )
+
+    def prepare(
+        self,
+        module: nn.Module,
+        prefix: str,
+        *,
+        slot: int,
+    ) -> ScratchLoadReport:
+        if slot < 0 or slot >= self.slots:
+            raise IndexError(f"scratch slot {slot} outside [0,{self.slots})")
+        started = time.perf_counter()
+        plans, _elements = self.plan(module, prefix)
+        source_bytes = 0
+        materialized_bytes = 0
+        key = (id(module), prefix, slot)
+        self.prime(module, prefix, slot=slot)
+        parameters = self._parameter_cache[key]
+        with self._locks[slot]:
+            for plan, parameter in zip(plans, parameters):
+                parameter.data.copy_(plan.source)
+                setattr(
+                    plan.target_module,
+                    plan.attribute_name,
+                    parameter,
+                )
+                source_bytes += (
+                    plan.source.numel() * plan.source.element_size()
+                )
+                materialized_bytes += (
+                    parameter.numel() * parameter.element_size()
+                )
+        elapsed = time.perf_counter() - started
+        self._preparations += 1
+        self._prepare_seconds += elapsed
+        self._source_bytes += source_bytes
+        self._materialized_bytes += materialized_bytes
+        return ScratchLoadReport(
+            tensors=len(plans),
+            source_bytes=source_bytes,
+            materialized_bytes=materialized_bytes,
+            seconds=elapsed,
+            slot=slot,
+        )
+
+    @staticmethod
+    def unbind(module: nn.Module) -> int:
+        count = 0
+        for parameter_name, parameter in list(module.named_parameters()):
+            if parameter.device.type != "meta":
+                set_parameter(
+                    module,
+                    parameter_name,
+                    torch.empty_like(parameter, device="meta"),
+                )
+                count += 1
+        return count
+
+    def unbind_prepared(self, module: nn.Module, prefix: str) -> int:
+        plans, _elements = self.plan(module, prefix)
+        meta = self._meta_cache[(id(module), prefix)]
+        for plan, parameter in zip(plans, meta):
+            setattr(
+                plan.target_module,
+                plan.attribute_name,
+                parameter,
+            )
+        return len(plans)
+
+    def release(self) -> int:
+        released = self.storage_bytes
+        self._parameter_cache.clear()
+        self._meta_cache.clear()
+        self._plan_cache.clear()
+        self._storage.clear()
+        self._locks.clear()
+        return released
 
 
 _loader = None

@@ -29,6 +29,7 @@ import local_safetensors  # noqa: E402
 import resident_shard_loader  # noqa: E402
 from resident_shard_loader import (  # noqa: E402
     DirectResidentLoader,
+    ResidentScratchArena,
     ResidentTensorBank,
 )
 
@@ -319,6 +320,88 @@ class LocalSafetensorsTests(unittest.TestCase):
             finally:
                 resident_shard_loader.release_runtime_bank()
                 resident_shard_loader._loader = old_loader
+
+    def test_resident_scratch_arena_reuses_fixed_source_conversion_slots(self):
+        import torch
+        from torch import nn
+
+        with LocalSafetensorsStore(self.root) as store:
+            loader = DirectResidentLoader(store)
+            bank = ResidentTensorBank(loader, device="cpu", dtype=None)
+            bank.load_names(
+                [
+                    self.names["gap"],
+                    "resident.scalar",
+                    "resident.matrix",
+                ]
+            )
+            module = nn.Module()
+            module.unrelated = nn.Module()
+            module.resident = nn.Module()
+            with torch.device("meta"):
+                module.unrelated.register_parameter(
+                    "tensor",
+                    nn.Parameter(torch.empty(1), requires_grad=False),
+                )
+                module.resident.register_parameter(
+                    "scalar",
+                    nn.Parameter(torch.empty(1), requires_grad=False),
+                )
+                module.resident.register_parameter(
+                    "matrix",
+                    nn.Parameter(torch.empty(3, 4), requires_grad=False),
+                )
+            arena = ResidentScratchArena.for_modules(
+                bank,
+                [(module, "")],
+                dtype=torch.float32,
+                slots=2,
+            )
+            slot_pointers = arena.slot_pointers
+            first = arena.prepare(module, "", slot=0)
+            self.assertEqual(first.tensors, 3)
+            self.assertTrue(
+                all(
+                    parameter.dtype == torch.float32
+                    for parameter in module.parameters()
+                )
+            )
+            np.testing.assert_array_equal(
+                module.unrelated.tensor.numpy(),
+                np.array([123], dtype=np.float32),
+            )
+            np.testing.assert_array_equal(
+                module.resident.matrix.numpy(),
+                np.arange(12, dtype=np.float32).reshape(3, 4),
+            )
+            first_parameter_pointers = tuple(
+                parameter.data_ptr() for parameter in module.parameters()
+            )
+            self.assertEqual(arena.unbind_prepared(module, ""), 3)
+            self.assertTrue(
+                all(
+                    parameter.device.type == "meta"
+                    for parameter in module.parameters()
+                )
+            )
+            arena.prepare(module, "", slot=0)
+            self.assertEqual(
+                tuple(parameter.data_ptr() for parameter in module.parameters()),
+                first_parameter_pointers,
+            )
+            arena.unbind_prepared(module, "")
+            arena.prepare(module, "", slot=1)
+            self.assertEqual(arena.slot_pointers, slot_pointers)
+            self.assertNotEqual(
+                tuple(parameter.data_ptr() for parameter in module.parameters()),
+                first_parameter_pointers,
+            )
+            with self.assertRaisesRegex(IndexError, "outside"):
+                arena.prepare(module, "", slot=2)
+            arena.unbind_prepared(module, "")
+            released = arena.release()
+            self.assertGreater(released, 0)
+            self.assertEqual(arena.storage_bytes, 0)
 
     def test_slab_adapter_holds_bank_lease_through_context(self):
         class FakeBank:

@@ -57,6 +57,11 @@ def parse_args(argv=None):
         help="enable F_NOCACHE after validating the normal M3 profile",
     )
     parser.add_argument(
+        "--runtime-profile-off",
+        action="store_true",
+        help="disable per-layer profiling synchronizations after profile validation",
+    )
+    parser.add_argument(
         "--resident-bank-dtype",
         choices=("runtime", "source"),
         default="runtime",
@@ -66,6 +71,21 @@ def parse_args(argv=None):
         "--pin-layers",
         type=int,
         help="override K3_PIN_LAYERS after validating the base profile",
+    )
+    parser.add_argument(
+        "--resident-scratch",
+        action="store_true",
+        help="reuse fixed FP32 slots for source-dtype layer materialization",
+    )
+    parser.add_argument(
+        "--resident-scratch-overlap",
+        action="store_true",
+        help="prepare layer N+1 in the alternate scratch slot during layer N",
+    )
+    parser.add_argument(
+        "--resident-scratch-slots",
+        type=int,
+        help="fixed FP32 scratch slot count",
     )
     parser.add_argument(
         "--oracle-evidence",
@@ -236,8 +256,12 @@ def run_sequence(
                 kr.LAYER_PROFILE[profile_start:]
             ),
         }
-        if len(row["layer_profile"]) != kr.NL:
-            raise AssertionError("token did not produce 93 layer profiles")
+        expected_profiles = kr.NL if kr.PROFILE else 0
+        if len(row["layer_profile"]) != expected_profiles:
+            raise AssertionError(
+                f"token produced {len(row['layer_profile'])}/"
+                f"{expected_profiles} layer profiles"
+            )
         if stats_delta["http_bytes"] or stats_delta["expert_http"]:
             raise AssertionError("multi-token direct runtime attempted HTTP")
         if not overlap and (
@@ -364,6 +388,13 @@ def aggregate(sequence):
         "moe_kernel_seconds": sum(
             row["phase_seconds"]["moe_kernel"] for row in rows
         ),
+        "resident_materialization_seconds": sum(
+            row["phase_seconds"]["resident_io"] for row in rows
+        ),
+        "resident_scratch_wait_seconds": sum(
+            row["phase_seconds"].get("resident_scratch_wait", 0.0)
+            for row in rows
+        ),
         "route_hits": sum(
             row["locality_vs_previous_token"]["hits"] for row in rows[1:]
         ),
@@ -434,8 +465,18 @@ def main(argv=None) -> int:
     os.environ["K3_RESIDENT_BANK_DTYPE"] = args.resident_bank_dtype
     if args.pin_layers is not None:
         os.environ["K3_PIN_LAYERS"] = str(args.pin_layers)
+    if args.resident_scratch or args.resident_scratch_overlap:
+        os.environ["K3_RESIDENT_SCRATCH"] = "1"
+    if args.resident_scratch_overlap:
+        os.environ["K3_RESIDENT_SCRATCH_OVERLAP"] = "1"
+    if args.resident_scratch_slots is not None:
+        os.environ["K3_RESIDENT_SCRATCH_SLOTS"] = str(
+            args.resident_scratch_slots
+        )
     if args.darwin_nocache:
         os.environ["K3_PREAD_NOCACHE"] = "1"
+    if args.runtime_profile_off:
+        os.environ["K3_PROFILE"] = "0"
     if os.environ.get("K3_DIRECT_OVERLAP") not in ("0", "1"):
         raise RuntimeError("set K3_DIRECT_OVERLAP=0 or 1 explicitly")
     torch.set_grad_enabled(False)
@@ -444,15 +485,19 @@ def main(argv=None) -> int:
     tree_before = model_tree_fingerprint(model_dir)
     evidence: dict[str, Any] = {
         "schema": (
-            "deltafin.m6-source-resident.v1"
-            if args.resident_bank_dtype == "source"
+            "deltafin.m7-resident-scratch.v1"
+            if args.resident_scratch or args.resident_scratch_overlap
             else (
-                "deltafin.m5-cold-gate.v1"
-                if os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY") == "1"
+                "deltafin.m6-source-resident.v1"
+                if args.resident_bank_dtype == "source"
                 else (
-                    "deltafin.m4-adaptive.v1"
-                    if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
-                    else "deltafin.m3-overlap.v1"
+                    "deltafin.m5-cold-gate.v1"
+                    if os.environ.get("K3_DIRECT_PREFETCH_COLD_ONLY") == "1"
+                    else (
+                        "deltafin.m4-adaptive.v1"
+                        if os.environ.get("K3_DIRECT_OVERLAP_POLICY") == "adaptive"
+                        else "deltafin.m3-overlap.v1"
+                    )
                 )
             )
         ),
@@ -465,7 +510,12 @@ def main(argv=None) -> int:
         "tokens": args.tokens,
         "sequence_order": args.sequence_order,
         "darwin_nocache": args.darwin_nocache,
+        "runtime_profile": not args.runtime_profile_off,
         "resident_bank_dtype": args.resident_bank_dtype,
+        "resident_scratch": (
+            args.resident_scratch or args.resident_scratch_overlap
+        ),
+        "resident_scratch_overlap": args.resident_scratch_overlap,
         "pin_layers": (
             args.pin_layers
             if args.pin_layers is not None
@@ -570,6 +620,10 @@ def main(argv=None) -> int:
         source_before = model_fingerprint(store)
         evidence["source_before"] = source_before
         layers = kr.build_layers()
+        scratch = kr.resident_scratch_arena()
+        evidence["resident_scratch_initial"] = (
+            scratch.snapshot() if scratch is not None else None
+        )
 
         if args.sequence_order == "serial-first":
             sequence_specs = (
@@ -628,6 +682,25 @@ def main(argv=None) -> int:
             name: aggregate(sequence)
             for name, sequence in evidence["sequences"].items()
         }
+        scratch = kr.resident_scratch_arena()
+        evidence["resident_scratch_final"] = (
+            scratch.snapshot() if scratch is not None else None
+        )
+        if scratch is not None:
+            initial = evidence["resident_scratch_initial"]
+            final = evidence["resident_scratch_final"]
+            if final["slot_pointers"] != initial["slot_pointers"]:
+                raise AssertionError("resident scratch slot addresses changed")
+            if final["storage_bytes"] != initial["storage_bytes"]:
+                raise AssertionError("resident scratch storage size changed")
+            expected_preparations = kr.NL * args.tokens * len(
+                evidence["sequences"]
+            )
+            if final["preparations"] != expected_preparations:
+                raise AssertionError(
+                    "resident scratch preparation count differs: "
+                    f"{final['preparations']}/{expected_preparations}"
+                )
         for logits in sequence_logits.values():
             all_logits.extend(logits)
         source_after = model_fingerprint(store)
