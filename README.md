@@ -243,6 +243,8 @@ startup. These variables exist for overriding that:
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
 | `K3_SERVER_METRICS_JSONL` | unset | append request-level TTFT, logical/physical/page-cache expert bytes, routed working-set growth, prefix-activation shape/LRU state, MPS/VM snapshots, and memo status; see the [M9 cache report](docs/m3ultra512-m9-long-lived.md) and [M13 prefix workload report](docs/m3ultra512-m13-server-workload.md) |
+| `K3_SERVER_SHAPE_TRACE_JSONL` | unset | append privacy-minimized request shape/LRU metadata without prompt content, token IDs, or hashes; enabled by the M3 Ultra profile for the [M14 capacity analysis](docs/m3ultra512-m14-shape-trace.md) |
+| `K3_SERVER_SHAPE_TRACE_MAX_BYTES` | `16777216` | rotate the lightweight shape trace at this size and retain one `.1` backup, bounding default trace storage to about 32 MiB |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
 
 ## Requirements
