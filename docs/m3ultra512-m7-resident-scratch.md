@@ -135,13 +135,13 @@ same eight tokens. They do not represent physical cold RAID bandwidth.
 
 | Metric | M6 dynamic source | M7 fixed serial |
 |---|---:|---:|
-| Mean wall time/token | 3.969 s | 3.863 s |
-| Eight-token wall time | 31.754 s | 30.901 s |
-| Resident enqueue/token | 0.386 s | 0.034 s |
-| Physical RAID bytes | 3.71 MB | 1.28 MB |
+| Mean wall time/token | 3.969 s | 3.880 s |
+| Eight-token wall time | 31.754 s | 31.038 s |
+| Resident enqueue/token | 0.386 s | 0.035 s |
+| Physical RAID bytes | 3.71 MB | 1.71 MB |
 
 The fixed arena reduced recorded resident enqueue time by 91.1% and improved
-warm wall time by 2.7%. The smaller wall improvement shows that completion of
+warm wall time by 2.3%. The smaller wall improvement shows that completion of
 the BF16-to-FP32 device conversion is largely charged at the following device
 synchronization/command dependency rather than at the Python enqueue call.
 
