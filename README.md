@@ -211,6 +211,7 @@ startup. These variables exist for overriding that:
 | `K3_RESIDENT_SCRATCH_OVERLAP` | `0` | prepare layer N+1 on a worker into the alternate slot; requires at least two slots and remains off because it did not beat serial M7 |
 | `K3_PREAD_NOCACHE` | `0` | normal direct-shard runtime uses buffered positional I/O and macOS page cache; `1` is a measurement control and does not purge pages already in RAM |
 | `K3_DIRECT_SLAB` | `0` | lease one of two reusable page-aligned 16-expert banks through synchronous CPU/Metal MoE compute; enabled by the M3 Ultra profile |
+| `K3_DIRECT_PREFILL_SLAB_EXPERTS` | `896` | maximum unique experts in the lazy single-bank multi-position direct-shard prefill arena; unused mmap slots consume no physical pages |
 | `K3_DIRECT_OVERLAP` | `0` | experimental previous-token route overlap for direct slabs; bitwise exact but kept off because the measured 19.5% reuse rate regressed warm decode; see the [M3 overlap report](docs/m3ultra512-m3-overlap.md) |
 | `K3_DIRECT_OVERLAP_POLICY` | `full` | `adaptive` ranks the previous route by router weight and reads only ranks whose learned Wilson precision clears the threshold; still experimental and default-off; see the [M4 adaptive report](docs/m3ultra512-m4-adaptive-prefetch.md) |
 | `K3_DIRECT_PREFETCH_MAX_EXPERTS` | `4` | maximum previous-route candidates per layer under the adaptive direct-slab policy |
@@ -227,7 +228,7 @@ startup. These variables exist for overriding that:
 | `K3_SPEC` | `1` | n-gram speculation (lossless) |
 | `K3_TEMPLATES` | `1` | template-layer buffer reuse |
 | `K3_PRELOAD` / `K3_PREFETCH` | `1` | background layer loading / expert prefetch |
-| `K3_METAL_POSITION_BATCH` | `0` | MPS/Metal-specific exact opt-in T>1 position-major MoE; measured +2.0% on accepted speculative passes and should be retuned per Mac |
+| `K3_METAL_POSITION_BATCH` | `0` | exact T>1 position-major Metal MoE; enabled by the M3 Ultra 512 GB profile for bounded direct-shard prefill after the [M10 validation](docs/m3ultra512-m10-prefill.md) |
 | `K3_MOE_TOP_K` | `16` | explicit quality/speed dial; fewer routed experts reduce expert bytes and can change output |
 | `K3_CPU_MOE_BATCH` | `auto` | exact persistent CPU MXFP4 worker ring; padded counters measured +3.6% at eight threads |
 | `K3_ASYNC_CACHE_WRITE` | `0` | opt-in cache-miss write overlap; `K3_CACHE_WRITE_QUEUE` (4) bounds outstanding buffers and `K3_CACHE_WRITE_WORKERS` (1) is retunable per host |
