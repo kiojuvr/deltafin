@@ -16,7 +16,10 @@ Design notes, honestly stated:
     at this speed.
   * Chat mode renders K3's template, which includes a thinking section; the
     response splits it into `reasoning_content` and `content` (DeepSeek-style).
-  * Each request uses a fresh KV/state cache; nothing is shared across calls.
+  * Each request uses a fresh KV/state cache by default. K3_PREFIX_STATE=1 is
+    an experimental exact-within-segmented-mode prefix snapshot. It is not in
+    the selected profile because segmented prefill changes long-prompt
+    floating-point numerics relative to the monolithic runtime.
   * A chat request's prompt is ~60+ tokens; on a COLD expert cache the prefill
     can take hours because most experts get fetched. Warm up with short
     completions first, or let the cache grow across sessions.
@@ -38,12 +41,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kimi_run as kr  # noqa: E402
+from prefix_state import (  # noqa: E402
+    PrefixStateSnapshot,
+    derive_chat_prefix,
+)
 from response_memo import DeterministicResponseMemo  # noqa: E402
 
 MODEL_ID = "deltafin-kimi-k3"
 MAX_TOKENS_CAP = int(os.environ.get("K3_SERVER_MAX_TOKENS", "0"))   # 0 = no cap
 RESPONSE_MEMO_ENTRIES = int(
     os.environ.get("K3_RESPONSE_MEMO_ENTRIES", "32"))
+PREFIX_STATE_ENABLED = os.environ.get("K3_PREFIX_STATE", "0") == "1"
 RESPONSE_MARKER = "<|open|>response<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
 
@@ -53,6 +61,9 @@ _layers = None
 _embed = None
 _memo = DeterministicResponseMemo(RESPONSE_MEMO_ENTRIES)
 _request_metrics = None
+_chat_prefix_ids = ()
+_prefix_snapshot = None
+_prefix_builds = 0
 
 
 def _configure_request_metrics():
@@ -84,7 +95,9 @@ def _configure_request_metrics():
     print(f"[serve] request metrics: {Path(path).expanduser()}", flush=True)
 
 
-def _metric_begin(rid, mode, ids, max_new, memo_hit):
+def _metric_begin(
+    rid, mode, ids, max_new, memo_hit, prefix_state=None
+):
     if _request_metrics is None:
         return None
     try:
@@ -94,6 +107,7 @@ def _metric_begin(rid, mode, ids, max_new, memo_hit):
             input_tokens=len(ids),
             max_new_tokens=max_new,
             memo_hit=memo_hit,
+            prefix_state=prefix_state,
         )
     except Exception as exc:
         print(f"[serve] metrics begin failed: {exc!r}", flush=True)
@@ -115,9 +129,16 @@ def _metric_finish(session, status, output_tokens=0, error=None):
 
 
 def _boot():
-    global _tok, _layers, _embed
+    global _tok, _layers, _embed, _chat_prefix_ids
     print("[serve] loading tokenizer + layer skeletons...", flush=True)
     _tok = kr.k3_official.load_tokenizer(kr.ROOT)
+    if PREFIX_STATE_ENABLED:
+        _chat_prefix_ids = derive_chat_prefix(_tok)
+        print(
+            f"[serve] exact chat prefix state enabled: "
+            f"{len(_chat_prefix_ids)} fixed tokens (lazy build)",
+            flush=True,
+        )
     kr.check_expert_pool()
     _layers = kr.build_layers()
     _embed = kr.LazyEmbed()
@@ -134,9 +155,78 @@ def _split_reasoning(text):
     return None, text
 
 
-def _gen(ids, max_new, on_delta=None, metric_session=None):
-    """Run one generation under the global lock; stream decoded-text deltas."""
+def _prefix_plan(mode, ids):
+    tokens = tuple(int(token) for token in ids)
+    eligible = (
+        PREFIX_STATE_ENABLED
+        and mode == "chat"
+        and bool(_chat_prefix_ids)
+        and len(tokens) > len(_chat_prefix_ids)
+        and tokens[: len(_chat_prefix_ids)] == _chat_prefix_ids
+    )
+    return {
+        "enabled": PREFIX_STATE_ENABLED,
+        "eligible": eligible,
+        "used": False,
+        "hit": bool(eligible and _prefix_snapshot is not None),
+        "prefix_tokens": len(_chat_prefix_ids) if eligible else 0,
+    }
+
+
+def _prepare_cache(mode, ids):
+    global _prefix_snapshot, _prefix_builds
     cache = kr.ml.KimiDynamicCache(kr.config)
+    plan = _prefix_plan(mode, ids)
+    if not plan["eligible"]:
+        return cache, 0, plan
+    if _prefix_snapshot is None:
+        started = time.perf_counter()
+        kr._step_ctx["step"] = 0
+        kr.forward_pass(
+            _layers,
+            cache,
+            _embed(_chat_prefix_ids),
+            step=0,
+            verbose=False,
+        )
+        kr._device_synchronize()
+        _prefix_snapshot = PrefixStateSnapshot.capture(
+            cache, _chat_prefix_ids
+        )
+        _prefix_builds += 1
+        plan["build_seconds"] = time.perf_counter() - started
+        plan["snapshot"] = _prefix_snapshot.snapshot()
+        print(
+            f"[serve] exact prefix state built in "
+            f"{plan['build_seconds']:.3f}s: "
+            f"{plan['snapshot']['storage_bytes'] / 1e9:.3f} GB",
+            flush=True,
+        )
+    else:
+        _prefix_snapshot.restore(cache)
+        plan["hit"] = True
+        plan["snapshot"] = _prefix_snapshot.snapshot()
+        print(
+            f"[serve] exact prefix state hit "
+            f"({_prefix_snapshot.description().prefix_tokens} tokens)",
+            flush=True,
+        )
+    plan["used"] = True
+    plan["builds"] = _prefix_builds
+    return cache, len(_chat_prefix_ids), plan
+
+
+def _gen(
+    ids,
+    max_new,
+    on_delta=None,
+    metric_session=None,
+    mode="completion",
+):
+    """Run one generation under the global lock; stream decoded-text deltas."""
+    cache, prefill_offset, prefix_plan = _prepare_cache(mode, ids)
+    if metric_session is not None:
+        metric_session["prefix_state"] = prefix_plan
     toks = []
     decoder = kr.IncrementalTokenDecoder(_tok) if on_delta else None
 
@@ -153,7 +243,17 @@ def _gen(ids, max_new, on_delta=None, metric_session=None):
         if on_delta and delta:
             on_delta(delta)
 
-    out = kr.generate(_layers, cache, _embed, ids, max_new, on_token=on_token)
+    out = kr.generate(
+        _layers,
+        cache,
+        _embed,
+        ids,
+        max_new,
+        on_token=on_token,
+        prefill_offset=prefill_offset,
+    )
+    if prefix_plan["used"]:
+        _prefix_snapshot.assert_intact()
     if decoder is not None:
         tail = decoder.finish()
         if tail:
@@ -229,8 +329,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             mode = "chat" if chat else "completion"
             cached = _memo.get(mode, ids, max_new)
+            prefix_plan = _prefix_plan(mode, ids)
+            if cached is not None:
+                prefix_plan["hit"] = False
+                prefix_plan["skip_reason"] = "response-memo"
             metric_session = _metric_begin(
-                rid, mode, ids, max_new, cached is not None
+                rid,
+                mode,
+                ids,
+                max_new,
+                cached is not None,
+                prefix_state=prefix_plan,
             )
             if cached is not None:
                 print(f"[serve] deterministic response memo hit "
@@ -263,6 +372,7 @@ class Handler(BaseHTTPRequestHandler):
                         max_new,
                         on_delta=on_delta,
                         metric_session=metric_session,
+                        mode=mode,
                     )
                     _memo.put(mode, ids, max_new, out, text, finish)
                 else:
@@ -286,7 +396,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if cached is None:
                 out, text, finish = _gen(
-                    ids, max_new, metric_session=metric_session
+                    ids,
+                    max_new,
+                    metric_session=metric_session,
+                    mode=mode,
                 )
                 _memo.put(mode, ids, max_new, out, text, finish)
             else:

@@ -45,6 +45,11 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
                 input_tokens=1,
                 max_new_tokens=2,
                 memo_hit=False,
+                prefix_state={
+                    "eligible": True,
+                    "hit": True,
+                    "prefix_tokens": 74,
+                },
             )
             current_stats["pread_bytes"] = 20
             metrics.observe_token(first)
@@ -60,6 +65,8 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
             )
             self.assertEqual(record["new_process_experts"], 2)
             self.assertEqual(record["direct_stats"]["pread_bytes"], 20)
+            self.assertTrue(record["prefix_state"]["hit"])
+            self.assertEqual(record["prefix_state"]["prefix_tokens"], 74)
 
             second = metrics.begin(
                 request_id="two",

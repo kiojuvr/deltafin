@@ -1883,14 +1883,32 @@ def _generation_runtime(fn):
 
 @_generation_runtime
 def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
-             verbose_prefill=False, log=lambda *a: None):
+             verbose_prefill=False, log=lambda *a: None, prefill_offset=0):
     """Greedy generation (+ certified-lossless n-gram speculation).
 
     Shared by the CLI and the OpenAI-compatible server. Calls on_token(token_id)
     as each token is emitted. Returns the emitted token list; a speculative
-    accept may emit one token past EOS_ID — callers trim at EOS_ID."""
+    accept may emit one token past EOS_ID — callers trim at EOS_ID.
+
+    ``prefill_offset`` is the exact token count already represented by
+    ``cache``. The remaining prompt is evaluated while the complete ``ids``
+    sequence stays available to the lossless n-gram drafter.
+    """
     if spec is None:
         spec = os.environ.get("K3_SPEC", "1") == "1"
+    ids = [int(token) for token in ids]
+    prefill_offset = int(prefill_offset)
+    if not 0 <= prefill_offset < len(ids):
+        raise ValueError(
+            f"prefill_offset must be in [0,{len(ids) - 1}], "
+            f"got {prefill_offset}"
+        )
+    cached_tokens = int(cache.get_seq_length() or 0)
+    if cached_tokens != prefill_offset:
+        raise ValueError(
+            "cache sequence length does not match prefill_offset: "
+            f"{cached_tokens} != {prefill_offset}"
+        )
     generated = []
 
     def emit(t):
@@ -1899,7 +1917,13 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
             on_token(t)
 
     _step_ctx["step"] = 0
-    logits = forward_pass(layers, cache, embed(ids), step=0, verbose=verbose_prefill)
+    logits = forward_pass(
+        layers,
+        cache,
+        embed(ids[prefill_offset:]),
+        step=0,
+        verbose=verbose_prefill,
+    )
     emit(int(logits[0, -1].argmax()))
     for _k in EXPERT_SEL:      # the union factor that matters is the decode one
         EXPERT_SEL[_k] = 0

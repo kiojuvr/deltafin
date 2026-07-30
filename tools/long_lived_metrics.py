@@ -66,6 +66,7 @@ class LongLivedRequestMetrics:
         input_tokens: int,
         max_new_tokens: int,
         memo_hit: bool,
+        prefix_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "request_id": request_id,
@@ -73,6 +74,7 @@ class LongLivedRequestMetrics:
             "input_tokens": input_tokens,
             "max_new_tokens": max_new_tokens,
             "memo_hit": memo_hit,
+            "prefix_state": dict(prefix_state or {}),
             "created_at": _now(),
             "started_ns": time.perf_counter_ns(),
             "before": self.snapshot(f"request-{request_id}-before"),
@@ -125,6 +127,7 @@ class LongLivedRequestMetrics:
             "status": status,
             "error": error,
             "memo_hit": session["memo_hit"],
+            "prefix_state": session["prefix_state"],
             "input_tokens": session["input_tokens"],
             "max_new_tokens": session["max_new_tokens"],
             "output_tokens": output_tokens,
