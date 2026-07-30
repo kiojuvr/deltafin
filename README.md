@@ -242,7 +242,7 @@ startup. These variables exist for overriding that:
 | `DELTAFIN_ROOT` | repo root | where caches and weights live |
 | `K3_HF_HOST` / `K3_HF_PATH` | Hugging Face | point expert fetching at a mirror |
 | `K3_SERVER_MAX_TOKENS` | unlimited | optional hard ceiling on server generations |
-| `K3_SERVER_METRICS_JSONL` | unset | append request-level TTFT, RAID-member reads, routed working-set growth, MPS/VM snapshots, and memo status for a long-lived local server; see the [M9 long-lived cache report](docs/m3ultra512-m9-long-lived.md) |
+| `K3_SERVER_METRICS_JSONL` | unset | append request-level TTFT, logical/physical/page-cache expert bytes, routed working-set growth, prefix-activation shape/LRU state, MPS/VM snapshots, and memo status; see the [M9 cache report](docs/m3ultra512-m9-long-lived.md) and [M13 prefix workload report](docs/m3ultra512-m13-server-workload.md) |
 | `K3_RESPONSE_MEMO_ENTRIES` | `32` | exact in-process replay cache for identical deterministic API requests; `0` disables |
 
 ## Requirements
