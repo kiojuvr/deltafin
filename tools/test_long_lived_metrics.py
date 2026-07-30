@@ -50,6 +50,11 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
                     "hit": True,
                     "prefix_tokens": 74,
                 },
+                prefix_activation={
+                    "eligible": True,
+                    "hit": True,
+                    "total_positions": 89,
+                },
             )
             current_stats["pread_bytes"] = 20
             metrics.observe_token(first)
@@ -67,6 +72,10 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
             self.assertEqual(record["direct_stats"]["pread_bytes"], 20)
             self.assertTrue(record["prefix_state"]["hit"])
             self.assertEqual(record["prefix_state"]["prefix_tokens"], 74)
+            self.assertTrue(record["prefix_activation"]["hit"])
+            self.assertEqual(
+                record["prefix_activation"]["total_positions"], 89
+            )
 
             second = metrics.begin(
                 request_id="two",

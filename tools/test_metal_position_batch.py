@@ -120,6 +120,43 @@ def test_position_batch_contract():
           events.index("trim") > events.index("abi"))
 
 
+def test_empty_prefix_rows_contract():
+    print("position-batch empty prefix rows")
+    ids = [[], [], [3, 7]]
+    weights = [[], [], [0.25, 0.75]]
+    x = np.arange(
+        3 * metal_moe.HIDDEN, dtype=np.float32
+    ).reshape(3, metal_moe.HIDDEN)
+    expected = {
+        "ptrs": [1003, 1007],
+        "offsets": [0, 0, 0, 2],
+        "weights": [0.25, 0.75],
+        "x": x,
+    }
+    events = []
+    owners = {eid: object() for eid in (3, 7)}
+    lib = FakeBatchLibrary(expected, events)
+    old_span = metal_moe._span_ptr
+    old_sync = metal_moe._sync_wrap
+    old_trim = metal_moe._trim
+    try:
+        metal_moe._span_ptr = (
+            lambda raw, _slot: (1000 + raw, owners[raw])
+        )
+        metal_moe._sync_wrap = lambda _ptr, _owner: None
+        metal_moe._trim = lambda _protect: None
+        got = metal_moe._metal_positions(
+            lib, x, ids, weights, {eid: eid for eid in owners}
+        )
+    finally:
+        metal_moe._span_ptr = old_span
+        metal_moe._sync_wrap = old_sync
+        metal_moe._trim = old_trim
+    expected_out = x + np.asarray([[0], [0], [2]], dtype=np.float32)
+    np.testing.assert_array_equal(got, expected_out)
+    check("empty rows preserve full position dimension", lib.calls == 1)
+
+
 class LegacyLibrary:
     pass
 
@@ -261,6 +298,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=7)
     args = parser.parse_args()
     test_position_batch_contract()
+    test_empty_prefix_rows_contract()
     test_opt_in_and_legacy_fallback()
     print("\nALL METAL POSITION-BATCH TESTS PASSED")
     if args.live:

@@ -1023,12 +1023,20 @@ def prefetch_prev_token():
 # sublinearity factor the depth cost model turns on. 1.00 = free, T = worst case.
 EXPERT_SEL = {"layer_calls": 0, "uniq": 0, "pos": 0}
 _ROUTE_OBSERVER = None
+_MOE_ACTIVATION_SESSION = None
 
 
 def set_route_observer(observer):
     """Install an optional focused-validator callback; ordinary runtime is null."""
     global _ROUTE_OBSERVER
     previous, _ROUTE_OBSERVER = _ROUTE_OBSERVER, observer
+    return previous
+
+
+def set_moe_activation_session(session):
+    """Install an optional focused shape-stable MoE capture/replay session."""
+    global _MOE_ACTIVATION_SESSION
+    previous, _MOE_ACTIVATION_SESSION = _MOE_ACTIVATION_SESSION, session
     return previous
 
 
@@ -1064,11 +1072,41 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
             "weights": topk_weight.to(torch.float32).tolist(),
         }
     flat = [e for r in rows for e in r]
-    ids = sorted(set(flat))
+    full_ids = sorted(set(flat))
+    activation_prefix = 0
+    compute_routing_record = routing_record
+    if _MOE_ACTIVATION_SESSION is not None:
+        if not DIRECT_SLAB_ACTIVE or MOE_BACKEND != "metal":
+            raise RuntimeError(
+                "prefix activation reuse requires direct slabs and Metal MoE"
+            )
+        weights = routing_record["weights"]
+        activation_prefix = _MOE_ACTIVATION_SESSION.prepare(
+            li, x, rows, weights
+        )
+        if activation_prefix:
+            compute_routing_record = {
+                "ids": (
+                    [[] for _ in range(activation_prefix)]
+                    + rows[activation_prefix:]
+                ),
+                "weights": (
+                    [[] for _ in range(activation_prefix)]
+                    + weights[activation_prefix:]
+                ),
+            }
+    demand_rows = rows[activation_prefix:]
+    ids = sorted({expert for row in demand_rows for expert in row})
+    if _MOE_ACTIVATION_SESSION is not None:
+        _MOE_ACTIVATION_SESSION.record_demand(
+            full_ids,
+            ids,
+            route_edges_skipped=activation_prefix * topk_ids.shape[1],
+        )
     EXPERT_SEL["layer_calls"] += 1
     EXPERT_SEL["uniq"] += len(ids)
     EXPERT_SEL["pos"] += len(rows)
-    _LAST_SEL[li] = ids
+    _LAST_SEL[li] = full_ids
     if _ROUTE_OBSERVER is not None:
         _ROUTE_OBSERVER(
             int(_step_ctx["step"]),
@@ -1088,10 +1126,14 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
         _LAST_ROUTE_RANK[li] = tuple(
             sorted(scores, key=scores.__getitem__, reverse=True)
         )
-        DIRECT_ADAPTIVE_POLICY.observe(li, ids)
+        DIRECT_ADAPTIVE_POLICY.observe(li, full_ids)
     if pilot.enabled():
         pilot.on_actual(li, rows)               # score the prediction made at li-1
     if GROUPED_MOE_ACTIVE:
+        if _MOE_ACTIVATION_SESSION is not None:
+            raise RuntimeError(
+                "prefix activation reuse is incompatible with grouped MoE"
+            )
         grouped = grouped_moe.try_infer(
             x, routing_record, li, fetch_v2, metal_moe)
         if grouped is not None:
@@ -1124,9 +1166,15 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
             )
             tk = time.time()
             out = _invoke_fast_moe(
-                x, topk_ids, topk_weight, raw, routing_record
+                x,
+                topk_ids,
+                topk_weight,
+                raw,
+                compute_routing_record,
             )
             TIMES["moe_kernel"] += time.time() - tk
+            if _MOE_ACTIVATION_SESSION is not None:
+                out = _MOE_ACTIVATION_SESSION.finish(li, out)
             return out
     t0 = time.time()
     raw = k3loader.fetch_experts(li, ids, dequant=not FAST_MOE)
@@ -1140,9 +1188,15 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
     if FAST_MOE:
         tk = time.time()
         out = _invoke_fast_moe(
-            x, topk_ids, topk_weight, raw, routing_record
+            x,
+            topk_ids,
+            topk_weight,
+            raw,
+            compute_routing_record,
         )
         TIMES["moe_kernel"] += time.time() - tk
+        if _MOE_ACTIVATION_SESSION is not None:
+            out = _MOE_ACTIVATION_SESSION.finish(li, out)
         return out
     for e, w in raw.items():
         ex = self.experts[e]
@@ -1883,7 +1937,8 @@ def _generation_runtime(fn):
 
 @_generation_runtime
 def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
-             verbose_prefill=False, log=lambda *a: None, prefill_offset=0):
+             verbose_prefill=False, log=lambda *a: None, prefill_offset=0,
+             prefill_activation_session=None):
     """Greedy generation (+ certified-lossless n-gram speculation).
 
     Shared by the CLI and the OpenAI-compatible server. Calls on_token(token_id)
@@ -1917,13 +1972,19 @@ def generate(layers, cache, embed, ids, max_new, spec=None, on_token=None,
             on_token(t)
 
     _step_ctx["step"] = 0
-    logits = forward_pass(
-        layers,
-        cache,
-        embed(ids[prefill_offset:]),
-        step=0,
-        verbose=verbose_prefill,
+    previous_activation = set_moe_activation_session(
+        prefill_activation_session
     )
+    try:
+        logits = forward_pass(
+            layers,
+            cache,
+            embed(ids[prefill_offset:]),
+            step=0,
+            verbose=verbose_prefill,
+        )
+    finally:
+        set_moe_activation_session(previous_activation)
     emit(int(logits[0, -1].argmax()))
     for _k in EXPERT_SEL:      # the union factor that matters is the decode one
         EXPERT_SEL[_k] = 0
