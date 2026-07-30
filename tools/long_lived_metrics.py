@@ -120,8 +120,25 @@ class LongLivedRequestMetrics:
         reused = routed & self._seen
         self._seen.update(routed)
         first = session["first_token"]
+        direct_stats = _numeric_delta(
+            session["stats_before"], stats_after
+        )
+        physical_bytes = _disk_delta(session["before"], after)
+        logical_bytes = direct_stats.get(
+            "demand_bytes", direct_stats.get("pread_bytes")
+        )
+        inferred_page_cache_bytes = (
+            max(0, logical_bytes - physical_bytes)
+            if logical_bytes is not None and physical_bytes is not None
+            else None
+        )
+        activation = session["prefix_activation"]
+        activation_detail = activation.get("activation", {})
+        avoided_experts = int(
+            activation_detail.get("skipped_unique_experts", 0)
+        )
         record = {
-            "schema": "deltafin.long-lived-request.v1",
+            "schema": "deltafin.long-lived-request.v2",
             "created_at": session["created_at"],
             "completed_at": _now(),
             "request_id": session["request_id"],
@@ -136,15 +153,25 @@ class LongLivedRequestMetrics:
             "output_tokens": output_tokens,
             "duration_ns": duration_ns,
             "ttft_ns": first["duration_ns"] if first is not None else None,
-            "physical_member_read_bytes": _disk_delta(
-                session["before"], after
+            "logical_expert_bytes": logical_bytes,
+            "physical_member_read_bytes": physical_bytes,
+            "inferred_page_cache_bytes": inferred_page_cache_bytes,
+            "physical_fraction": (
+                physical_bytes / logical_bytes
+                if physical_bytes is not None and logical_bytes
+                else None
             ),
             "ttft_physical_member_read_bytes": (
                 _disk_delta(session["before"], first["snapshot"])
                 if first is not None else None
             ),
-            "direct_stats": _numeric_delta(
-                session["stats_before"], stats_after
+            "direct_stats": direct_stats,
+            "prefix_activation_avoided_experts": avoided_experts,
+            "prefix_activation_avoided_expert_bytes": (
+                avoided_experts * self.expert_bytes
+            ),
+            "prefix_activation_skipped_route_edges": int(
+                activation_detail.get("skipped_route_edges", 0)
             ),
             "unique_routed_experts": len(routed),
             "unique_expert_working_set_bytes": (

@@ -253,6 +253,31 @@ class PrefixActivationCache:
         self.builds = 0
         self.hits = 0
         self.evictions = 0
+        self.invalidations = 0
+        self.capture_failures = 0
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return compact cache ownership and LRU state for telemetry."""
+        rows = [
+            {
+                "total_positions": shape,
+                "owned_bytes": session.snapshot()["owned_bytes"],
+            }
+            for shape, session in self._sessions.items()
+        ]
+        return {
+            "entries": len(rows),
+            "max_entries": self.max_entries,
+            "resident_shapes_lru": [
+                row["total_positions"] for row in rows
+            ],
+            "owned_bytes": sum(row["owned_bytes"] for row in rows),
+            "builds": self.builds,
+            "hits": self.hits,
+            "evictions": self.evictions,
+            "invalidations": self.invalidations,
+            "capture_failures": self.capture_failures,
+        }
 
     def preview(self, mode: str, token_ids) -> dict[str, Any]:
         tokens = tuple(int(token) for token in token_ids)
@@ -262,6 +287,7 @@ class PrefixActivationCache:
             and tokens[: len(self.prefix_token_ids)] == self.prefix_token_ids
         )
         total = len(tokens) if eligible else 0
+        cache = self.snapshot()
         return {
             "enabled": True,
             "eligible": eligible,
@@ -274,8 +300,9 @@ class PrefixActivationCache:
             ),
             "prefix_tokens": len(self.prefix_token_ids) if eligible else 0,
             "total_positions": total,
-            "entries": len(self._sessions),
-            "max_entries": self.max_entries,
+            "entries": cache["entries"],
+            "max_entries": cache["max_entries"],
+            "cache_before": cache,
         }
 
     def begin(
@@ -307,6 +334,7 @@ class PrefixActivationCache:
         expected_layers: int,
     ) -> dict[str, Any]:
         if plan["action"] == "capture":
+            activation = session.snapshot()
             session.arm_replay(expected_layers=expected_layers)
             total = int(plan["total_positions"])
             replaced = self._sessions.pop(total, None)
@@ -320,17 +348,13 @@ class PrefixActivationCache:
                 self.evictions += 1
         elif plan["action"] == "replay":
             session.finish_replay(expected_layers=expected_layers)
+            activation = session.snapshot()
         else:
             raise RuntimeError(f"invalid activation action {plan['action']}")
-        plan.update(
-            {
-                "entries": len(self._sessions),
-                "builds": self.builds,
-                "hits": self.hits,
-                "evictions": self.evictions,
-                "activation": session.snapshot(),
-            }
-        )
+        after = self.snapshot()
+        plan.update(after)
+        plan["cache_after"] = after
+        plan["activation"] = activation
         return plan
 
     def abort(
@@ -342,12 +366,17 @@ class PrefixActivationCache:
             return
         if plan.get("action") == "capture":
             session.close()
-            return
-        if plan.get("action") == "replay":
+            self.capture_failures += 1
+        elif plan.get("action") == "replay":
             total = int(plan["total_positions"])
             if self._sessions.get(total) is session:
                 self._sessions.pop(total)
                 session.close()
+                self.invalidations += 1
+                plan["invalidated"] = True
+        after = self.snapshot()
+        plan.update(after)
+        plan["cache_after"] = after
 
     def close(self) -> None:
         for session in self._sessions.values():

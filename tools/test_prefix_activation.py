@@ -116,9 +116,12 @@ class PrefixActivationTests(unittest.TestCase):
         session.finish(0, torch.zeros(4, 4))
         cache.complete(session, hit, expected_layers=1)
         self.assertEqual(cache.hits, 1)
+        self.assertEqual(cache.snapshot()["resident_shapes_lru"], [4])
+        self.assertEqual(cache.snapshot()["owned_bytes"], 64)
 
         complete_capture(5)
         self.assertEqual(cache.evictions, 1)
+        self.assertEqual(cache.snapshot()["resident_shapes_lru"], [5])
         _session, miss = cache.begin("chat", first)
         self.assertEqual(miss["action"], "capture")
 
@@ -144,9 +147,22 @@ class PrefixActivationTests(unittest.TestCase):
         replay, replay_plan = cache.begin("chat", [10, 30])
         self.assertEqual(replay_plan["action"], "replay")
         cache.abort(replay, replay_plan)
+        self.assertEqual(cache.invalidations, 1)
+        self.assertEqual(cache.snapshot()["resident_shapes_lru"], [])
+        self.assertTrue(replay_plan["invalidated"])
+        self.assertEqual(
+            replay_plan["cache_after"]["invalidations"], 1
+        )
         replacement, replacement_plan = cache.begin("chat", [10, 40])
         self.assertEqual(replacement_plan["action"], "capture")
         self.assertIsNot(replacement, replay)
+
+    def test_failed_capture_is_counted_without_becoming_resident(self):
+        cache = PrefixActivationCache([10])
+        session, plan = cache.begin("chat", [10, 20])
+        cache.abort(session, plan)
+        self.assertEqual(cache.capture_failures, 1)
+        self.assertEqual(plan["cache_after"]["resident_shapes_lru"], [])
 
 
 if __name__ == "__main__":

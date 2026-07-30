@@ -322,7 +322,9 @@ def _gen(
             f"[serve] prefix activation {action}: "
             f"shape={activation_plan['total_positions']}, "
             f"owned={snapshot['owned_bytes'] / 2**20:.1f} MiB, "
-            f"skipped_edges={snapshot['skipped_route_edges']}",
+            f"skipped_edges={snapshot['skipped_route_edges']}, "
+            f"resident_shapes="
+            f"{activation_plan['resident_shapes_lru']}",
             flush=True,
         )
     if prefix_plan["used"]:

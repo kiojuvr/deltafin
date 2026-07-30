@@ -54,6 +54,10 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
                     "eligible": True,
                     "hit": True,
                     "total_positions": 89,
+                    "activation": {
+                        "skipped_unique_experts": 3,
+                        "skipped_route_edges": 48,
+                    },
                 },
             )
             current_stats["pread_bytes"] = 20
@@ -70,6 +74,14 @@ class LongLivedRequestMetricsTests(unittest.TestCase):
             )
             self.assertEqual(record["new_process_experts"], 2)
             self.assertEqual(record["direct_stats"]["pread_bytes"], 20)
+            self.assertEqual(record["logical_expert_bytes"], 20)
+            self.assertEqual(record["inferred_page_cache_bytes"], 0)
+            self.assertEqual(
+                record["prefix_activation_avoided_expert_bytes"], 30
+            )
+            self.assertEqual(
+                record["prefix_activation_skipped_route_edges"], 48
+            )
             self.assertTrue(record["prefix_state"]["hit"])
             self.assertEqual(record["prefix_state"]["prefix_tokens"], 74)
             self.assertTrue(record["prefix_activation"]["hit"])
