@@ -75,6 +75,7 @@ class ExpertSlabBank:
         self._slot_experts: list[int | None] = [None] * capacity
         self._last_read_ids: tuple[int, ...] = ()
         self._layer: int | None = None
+        self._high_water_experts = 0
         self._closed = False
         self._build_k3_views()
 
@@ -131,6 +132,10 @@ class ExpertSlabBank:
     @property
     def last_read_ids(self) -> tuple[int, ...]:
         return self._last_read_ids
+
+    @property
+    def high_water_experts(self) -> int:
+        return self._high_water_experts
 
     def _layouts(self, layer: int, ids: tuple[int, ...]):
         layouts = [self.store.expert_layout(layer, expert) for expert in ids]
@@ -228,6 +233,7 @@ class ExpertSlabBank:
         self._read_assignments(layer, assignments, workers)
         self._layer = layer
         self._expert_ids = ids
+        self._high_water_experts = max(self._high_water_experts, len(ids))
         self._slot_experts = list(ids) + [None] * (self.capacity - len(ids))
         self._last_read_ids = ids
         return self._mapping_for(
@@ -280,6 +286,7 @@ class ExpertSlabBank:
         self._slot_experts = slot_experts
         self._layer = layer
         self._expert_ids = ids
+        self._high_water_experts = max(self._high_water_experts, len(ids))
         self._last_read_ids = misses
         return self._mapping_for(assigned)
 

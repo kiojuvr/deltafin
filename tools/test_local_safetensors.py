@@ -523,6 +523,71 @@ class LocalSafetensorsTests(unittest.TestCase):
             direct_shard_loader.close()
             direct_shard_loader.stats.update(old_stats)
 
+    def test_multi_position_slab_is_bounded_and_leased_through_compute(self):
+        class Layout:
+            byte_length = 17
+
+        class FakeStore:
+            def expert_layout(self, layer, expert):
+                return Layout()
+
+            def close(self):
+                pass
+
+        class FakeBank:
+            def __init__(self):
+                self.closed = False
+
+            def load(self, layer, ids, workers):
+                return {
+                    expert: {
+                        "layer": layer,
+                        "workers": workers,
+                    }
+                    for expert in ids
+                }
+
+            def close(self):
+                self.closed = True
+
+        direct_shard_loader.close()
+        old_slab = direct_shard_loader.DIRECT_SLAB
+        old_capacity = direct_shard_loader.PREFILL_SLAB_EXPERTS
+        old_stats = dict(direct_shard_loader.stats)
+        bank = FakeBank()
+        direct_shard_loader.DIRECT_SLAB = True
+        direct_shard_loader.PREFILL_SLAB_EXPERTS = 32
+        direct_shard_loader._store = FakeStore()
+        direct_shard_loader._prefill_slab = bank
+        try:
+            ids = list(range(17))
+            with direct_shard_loader.prefill_slab_experts(
+                4, ids, workers=3
+            ) as raw:
+                self.assertEqual(set(raw), set(ids))
+                self.assertFalse(bank.closed)
+            self.assertEqual(
+                direct_shard_loader.stats["prefill_slab_loads"]
+                - old_stats["prefill_slab_loads"],
+                1,
+            )
+            self.assertEqual(
+                direct_shard_loader.stats["prefill_slab_experts"]
+                - old_stats["prefill_slab_experts"],
+                17,
+            )
+            with self.assertRaisesRegex(ValueError, "holds 32"):
+                with direct_shard_loader.prefill_slab_experts(
+                    4, range(33), workers=1
+                ):
+                    pass
+        finally:
+            direct_shard_loader.DIRECT_SLAB = old_slab
+            direct_shard_loader.PREFILL_SLAB_EXPERTS = old_capacity
+            direct_shard_loader.close()
+            direct_shard_loader.stats.update(old_stats)
+        self.assertTrue(bank.closed)
+
     def test_slab_settle_releases_every_bank_after_failure(self):
         direct_shard_loader.close()
         available = queue.Queue(maxsize=2)

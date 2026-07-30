@@ -978,7 +978,11 @@ if DIRECT_OVERLAP_POLICY == "adaptive":
 else:
     DIRECT_ADAPTIVE_POLICY = None
 if DIRECT_SLAB_ACTIVE:
-    print("[config] direct expert source: reusable 16x2 aligned slabs", flush=True)
+    print(
+        "[config] direct expert source: reusable 16x2 decode slabs + "
+        f"lazy {direct_shard_loader.PREFILL_SLAB_EXPERTS}-expert prefill slab",
+        flush=True,
+    )
 if DIRECT_OVERLAP_ACTIVE:
     print(
         "[config] direct slab overlap: "
@@ -1018,6 +1022,14 @@ def prefetch_prev_token():
 # reads the UNION of every position's selection, so `uniq/pos` below is the
 # sublinearity factor the depth cost model turns on. 1.00 = free, T = worst case.
 EXPERT_SEL = {"layer_calls": 0, "uniq": 0, "pos": 0}
+_ROUTE_OBSERVER = None
+
+
+def set_route_observer(observer):
+    """Install an optional focused-validator callback; ordinary runtime is null."""
+    global _ROUTE_OBSERVER
+    previous, _ROUTE_OBSERVER = _ROUTE_OBSERVER, observer
+    return previous
 
 
 def _issue_next_expert_prefetch(li):
@@ -1057,6 +1069,12 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
     EXPERT_SEL["uniq"] += len(ids)
     EXPERT_SEL["pos"] += len(rows)
     _LAST_SEL[li] = ids
+    if _ROUTE_OBSERVER is not None:
+        _ROUTE_OBSERVER(
+            int(_step_ctx["step"]),
+            li,
+            tuple(tuple(int(expert) for expert in row) for row in rows),
+        )
     if DIRECT_ADAPTIVE_POLICY is not None:
         weights = (
             routing_record["weights"]
@@ -1084,9 +1102,14 @@ def moe_infer_lazy(self, x, topk_ids, topk_weight):
             TRACE.record(_step_ctx["step"], li, flat,
                          routing_record["weights"])
             return out
-    if DIRECT_SLAB_ACTIVE and len(ids) <= 16:
+    if DIRECT_SLAB_ACTIVE:
+        slab_provider = (
+            direct_shard_loader.slab_experts
+            if len(ids) <= 16
+            else direct_shard_loader.prefill_slab_experts
+        )
         t0 = time.time()
-        with direct_shard_loader.slab_experts(li, ids) as raw:
+        with slab_provider(li, ids) as raw:
             TIMES["expert_fetch"] += time.time() - t0
             _issue_next_expert_prefetch(li)
             TRACE.record(

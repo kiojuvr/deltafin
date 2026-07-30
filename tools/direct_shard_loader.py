@@ -29,6 +29,13 @@ SIDECAR = os.environ.get("K3_DIRECT_SHARDS_SIDECAR")
 WORKERS = int(os.environ.get("K3_PREAD_WORKERS", "8"))
 DIRECT_SLAB = os.environ.get("K3_DIRECT_SLAB", "0") == "1"
 DIRECT_OVERLAP = os.environ.get("K3_DIRECT_OVERLAP", "0") == "1"
+PREFILL_SLAB_EXPERTS = int(
+    os.environ.get("K3_DIRECT_PREFILL_SLAB_EXPERTS", "896")
+)
+if not 16 <= PREFILL_SLAB_EXPERTS <= 896:
+    raise ValueError(
+        "K3_DIRECT_PREFILL_SLAB_EXPERTS must be in [16, 896]"
+    )
 DARWIN_NOCACHE = os.environ.get(
     "K3_PREAD_NOCACHE", "0"
 ) == "1"
@@ -49,6 +56,10 @@ stats = {
     "slab_loads": 0,
     "slab_bytes": 0,
     "slab_s": 0.0,
+    "prefill_slab_loads": 0,
+    "prefill_slab_experts": 0,
+    "prefill_slab_bytes": 0,
+    "prefill_slab_s": 0.0,
     "overlap_prefetches": 0,
     "overlap_prefetch_skipped": 0,
     "overlap_prefetch_experts": 0,
@@ -75,6 +86,8 @@ _slabs = None
 _slab_available: queue.Queue[int] | None = None
 _slab_executor: concurrent.futures.ThreadPoolExecutor | None = None
 _slab_pending = {}
+_prefill_slab_lock = threading.Lock()
+_prefill_slab = None
 
 
 def store() -> LocalSafetensorsStore:
@@ -119,6 +132,33 @@ def overlap_enabled() -> bool:
     return DIRECT_SLAB and DIRECT_OVERLAP
 
 
+def prefill_slab_snapshot() -> dict[str, object]:
+    bank = _prefill_slab
+    return {
+        "allocated": bank is not None,
+        "capacity_experts": PREFILL_SLAB_EXPERTS,
+        "virtual_bytes": (
+            bank.nbytes
+            if bank is not None
+            else PREFILL_SLAB_EXPERTS * 17_547_264
+        ),
+        "active_experts": len(bank.expert_ids) if bank is not None else 0,
+        "active_bytes": (
+            len(bank.expert_ids) * bank.slot_bytes
+            if bank is not None else 0
+        ),
+        "high_water_experts": (
+            bank.high_water_experts if bank is not None else 0
+        ),
+        "high_water_bytes": (
+            bank.high_water_experts * bank.slot_bytes
+            if bank is not None else 0
+        ),
+        "page_aligned": bank.page_aligned if bank is not None else None,
+        "base_address": bank.base_address if bank is not None else None,
+    }
+
+
 def _slab_pool():
     global _slabs, _slab_available, _slab_executor
     if _slabs is not None:
@@ -135,6 +175,22 @@ def _slab_pool():
                 max_workers=1, thread_name_prefix="k3-direct-overlap"
             )
     return _slabs, _slab_available
+
+
+def _prefill_slab_pool():
+    global _prefill_slab
+    if _prefill_slab is not None:
+        return _prefill_slab
+    with _prefill_slab_lock:
+        if _prefill_slab is None:
+            from expert_slab import ExpertSlabBank
+
+            _prefill_slab = ExpertSlabBank(
+                store(),
+                capacity=PREFILL_SLAB_EXPERTS,
+                name="prefill-bank",
+            )
+    return _prefill_slab
 
 
 def _read_bytes(layer: int, ids) -> int:
@@ -318,6 +374,39 @@ def slab_experts(layer: int, eids, workers: int | None = None):
         available.put(bank_index)
 
 
+@contextlib.contextmanager
+def prefill_slab_experts(
+    layer: int, eids, workers: int | None = None
+):
+    """Use one bounded page-aligned bank for a multi-position expert union."""
+    ids = tuple(int(expert) for expert in eids)
+    if not DIRECT_SLAB:
+        raise RuntimeError("K3_DIRECT_SLAB is disabled")
+    if len(ids) > PREFILL_SLAB_EXPERTS:
+        raise ValueError(
+            f"prefill slab holds {PREFILL_SLAB_EXPERTS} experts, "
+            f"got {len(ids)}"
+        )
+    if len(ids) != len(set(ids)):
+        raise ValueError("expert IDs must be unique")
+    raw = None
+    bank = _prefill_slab_pool()
+    with _prefill_slab_lock:
+        started = time.perf_counter()
+        raw = bank.load(layer, ids, workers=workers or WORKERS)
+        elapsed = time.perf_counter() - started
+        _record_slab_read(layer, ids, elapsed, prefetch=False)
+        with _stats_lock:
+            stats["prefill_slab_loads"] += 1
+            stats["prefill_slab_experts"] += len(ids)
+            stats["prefill_slab_bytes"] += _read_bytes(layer, ids)
+            stats["prefill_slab_s"] += elapsed
+        try:
+            yield raw
+        finally:
+            raw = None
+
+
 def fetch_expert_raw(
     layer: int, expert: int
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -370,7 +459,7 @@ def fetch_experts(
 
 
 def close() -> None:
-    global _store, _slabs, _slab_available, _slab_executor
+    global _store, _slabs, _slab_available, _slab_executor, _prefill_slab
     settle_slab_prefetches(raise_errors=False)
     with _slab_lock:
         slabs, _slabs = _slabs, None
@@ -380,6 +469,10 @@ def close() -> None:
         executor.shutdown(wait=True)
     if slabs is not None:
         slabs.close()
+    with _prefill_slab_lock:
+        prefill_slab, _prefill_slab = _prefill_slab, None
+    if prefill_slab is not None:
+        prefill_slab.close()
     with _store_lock:
         local_store, _store = _store, None
     if local_store is not None:

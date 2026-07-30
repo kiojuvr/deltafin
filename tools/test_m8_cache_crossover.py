@@ -94,6 +94,8 @@ class M8CacheCrossoverTests(unittest.TestCase):
             "K3_RESIDENT_SOURCE": "direct-shards",
             "K3_RESIDENT_BANK": "1",
             "K3_DIRECT_SLAB": "1",
+            "K3_DIRECT_PREFILL_SLAB_EXPERTS": "896",
+            "K3_METAL_POSITION_BATCH": "1",
             "K3_PREAD_NOCACHE": "0",
             "K3_DTYPE": "fp32",
             "K3_APPROX": "0",
