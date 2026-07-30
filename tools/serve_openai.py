@@ -72,6 +72,7 @@ _layers = None
 _embed = None
 _memo = DeterministicResponseMemo(RESPONSE_MEMO_ENTRIES)
 _request_metrics = None
+_shape_trace = None
 _chat_prefix_ids = ()
 _prefix_snapshot = None
 _prefix_builds = 0
@@ -105,6 +106,26 @@ def _configure_request_metrics():
         expert_bytes=17_547_264,
     )
     print(f"[serve] request metrics: {Path(path).expanduser()}", flush=True)
+
+
+def _configure_shape_trace():
+    global _shape_trace
+    path = os.environ.get("K3_SERVER_SHAPE_TRACE_JSONL")
+    if not path:
+        return
+    from shape_trace import ShapeTraceWriter
+
+    max_bytes = int(
+        os.environ.get(
+            "K3_SERVER_SHAPE_TRACE_MAX_BYTES", str(16 * 1024 * 1024)
+        )
+    )
+    _shape_trace = ShapeTraceWriter(path, max_bytes=max_bytes)
+    print(
+        f"[serve] privacy-minimized shape trace: "
+        f"{Path(path).expanduser()} (max {max_bytes} bytes + one backup)",
+        flush=True,
+    )
 
 
 def _metric_begin(
@@ -172,6 +193,7 @@ def _boot():
     _layers = kr.build_layers()
     _embed = kr.LazyEmbed()
     _configure_request_metrics()
+    _configure_shape_trace()
     print("[serve] ready", flush=True)
 
 
@@ -406,6 +428,14 @@ class Handler(BaseHTTPRequestHandler):
             cached = _memo.get(mode, ids, max_new)
             prefix_plan = _prefix_plan(mode, ids)
             activation_plan = _prefix_activation_plan(mode, ids)
+            if _shape_trace is not None:
+                _shape_trace.record(
+                    request_id=rid,
+                    mode=mode,
+                    total_positions=len(ids),
+                    memo_hit=cached is not None,
+                    activation=activation_plan,
+                )
             if cached is not None:
                 prefix_plan["hit"] = False
                 prefix_plan["skip_reason"] = "response-memo"

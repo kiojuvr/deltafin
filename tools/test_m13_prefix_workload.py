@@ -7,7 +7,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m13_prefix_workload import simulate_lru, summarize
+from m13_prefix_workload import reuse_distances, simulate_lru, summarize
 
 
 def record(shape, action, *, logical=100, physical=25, avoided=0):
@@ -43,7 +43,15 @@ class M13PrefixWorkloadTests(unittest.TestCase):
         self.assertEqual(one["hits"], 0)
         self.assertEqual(two["hits"], 2)
         self.assertEqual(two["evictions"], 2)
+        self.assertEqual(two["compulsory_misses"], 3)
+        self.assertEqual(two["eviction_misses"], 1)
         self.assertEqual(two["resident_shapes_lru"], [90, 91])
+
+    def test_reuse_distance_is_distinct_shape_stack_distance(self):
+        self.assertEqual(
+            reuse_distances([89, 90, 89, 91, 90, 90]),
+            [None, None, 1, None, 2, 0],
+        )
 
     def test_summary_groups_shapes_and_io(self):
         rows = [

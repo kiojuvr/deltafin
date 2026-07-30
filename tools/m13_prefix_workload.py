@@ -37,6 +37,8 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
         raise ValueError("LRU capacity must be positive")
     resident: OrderedDict[int, None] = OrderedDict()
     hits = captures = evictions = 0
+    compulsory_misses = eviction_misses = 0
+    seen = set()
     trace = []
     for shape in (int(value) for value in shapes):
         hit = shape in resident
@@ -46,6 +48,13 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
             action = "replay"
         else:
             captures += 1
+            if shape in seen:
+                miss_class = "eviction"
+                eviction_misses += 1
+            else:
+                miss_class = "compulsory"
+                compulsory_misses += 1
+                seen.add(shape)
             resident[shape] = None
             action = "capture"
             if len(resident) > capacity:
@@ -55,6 +64,7 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
             {
                 "shape": shape,
                 "action": action,
+                "miss_class": None if hit else miss_class,
                 "resident_shapes_lru": list(resident),
             }
         )
@@ -64,11 +74,28 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
         "requests": requests,
         "hits": hits,
         "captures": captures,
+        "compulsory_misses": compulsory_misses,
+        "eviction_misses": eviction_misses,
         "evictions": evictions,
         "hit_rate": hits / requests if requests else None,
         "resident_shapes_lru": list(resident),
         "trace": trace,
     }
+
+
+def reuse_distances(shapes: Iterable[int]) -> list[int | None]:
+    """Return LRU stack distance; first occurrences have no distance."""
+    stack: list[int] = []
+    distances: list[int | None] = []
+    for shape in (int(value) for value in shapes):
+        if shape not in stack:
+            distances.append(None)
+        else:
+            position = stack.index(shape)
+            distances.append(len(stack) - position - 1)
+            stack.pop(position)
+        stack.append(shape)
+    return distances
 
 
 def _sum(rows, key):
