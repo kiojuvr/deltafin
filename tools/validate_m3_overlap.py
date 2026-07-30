@@ -52,6 +52,12 @@ def parse_args(argv=None):
         default="serial-first",
     )
     parser.add_argument(
+        "--sequence-set",
+        choices=("full", "serial-only"),
+        default="full",
+        help="full parity triplet or one non-repeated serial sequence",
+    )
+    parser.add_argument(
         "--darwin-nocache",
         action="store_true",
         help="enable F_NOCACHE after validating the normal M3 profile",
@@ -465,10 +471,12 @@ def main(argv=None) -> int:
     os.environ["K3_RESIDENT_BANK_DTYPE"] = args.resident_bank_dtype
     if args.pin_layers is not None:
         os.environ["K3_PIN_LAYERS"] = str(args.pin_layers)
-    if args.resident_scratch or args.resident_scratch_overlap:
-        os.environ["K3_RESIDENT_SCRATCH"] = "1"
-    if args.resident_scratch_overlap:
-        os.environ["K3_RESIDENT_SCRATCH_OVERLAP"] = "1"
+    os.environ["K3_RESIDENT_SCRATCH"] = (
+        "1" if args.resident_scratch or args.resident_scratch_overlap else "0"
+    )
+    os.environ["K3_RESIDENT_SCRATCH_OVERLAP"] = (
+        "1" if args.resident_scratch_overlap else "0"
+    )
     if args.resident_scratch_slots is not None:
         os.environ["K3_RESIDENT_SCRATCH_SLOTS"] = str(
             args.resident_scratch_slots
@@ -509,6 +517,7 @@ def main(argv=None) -> int:
         "token_id": args.token_id,
         "tokens": args.tokens,
         "sequence_order": args.sequence_order,
+        "sequence_set": args.sequence_set,
         "darwin_nocache": args.darwin_nocache,
         "runtime_profile": not args.runtime_profile_off,
         "resident_bank_dtype": args.resident_bank_dtype,
@@ -625,7 +634,11 @@ def main(argv=None) -> int:
             scratch.snapshot() if scratch is not None else None
         )
 
-        if args.sequence_order == "serial-first":
+        if args.sequence_set == "serial-only":
+            sequence_specs = (
+                ("serial_first", "serial-first", False),
+            )
+        elif args.sequence_order == "serial-first":
             sequence_specs = (
                 ("serial_first", "serial-first", False),
                 ("serial_warm", "serial-warm", False),
@@ -653,7 +666,9 @@ def main(argv=None) -> int:
             sequence_logits[key] = logits
             write_evidence(args.output, evidence)
 
-        if args.sequence_order == "serial-first":
+        if args.sequence_set == "serial-only":
+            pass
+        elif args.sequence_order == "serial-first":
             evidence["serial_repeat_parity"] = compare_sequences(
                 evidence["sequences"]["serial_first"],
                 evidence["sequences"]["serial_warm"],
@@ -667,15 +682,21 @@ def main(argv=None) -> int:
                 sequence_logits["overlap_first"],
                 sequence_logits["serial_warm"],
             )
-        evidence["overlap_parity"] = compare_sequences(
-            evidence["sequences"]["serial_warm"],
-            evidence["sequences"]["overlap_warm"],
-            sequence_logits["serial_warm"],
-            sequence_logits["overlap_warm"],
-        )
-        if args.oracle_evidence is not None:
-            evidence["saved_oracle_parity"] = compare_saved_oracle(
+        if args.sequence_set != "serial-only":
+            evidence["overlap_parity"] = compare_sequences(
                 evidence["sequences"]["serial_warm"],
+                evidence["sequences"]["overlap_warm"],
+                sequence_logits["serial_warm"],
+                sequence_logits["overlap_warm"],
+            )
+        if args.oracle_evidence is not None:
+            oracle_key = (
+                "serial_first"
+                if args.sequence_set == "serial-only"
+                else "serial_warm"
+            )
+            evidence["saved_oracle_parity"] = compare_saved_oracle(
+                evidence["sequences"][oracle_key],
                 args.oracle_evidence,
             )
         evidence["aggregate"] = {
