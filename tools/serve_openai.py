@@ -63,6 +63,12 @@ PREFIX_ACTIVATION_ENABLED = (
 PREFIX_ACTIVATION_ENTRIES = int(
     os.environ.get("K3_PREFIX_ACTIVATION_ENTRIES", "2")
 )
+PREFIX_ACTIVATION_ADMISSION = os.environ.get(
+    "K3_PREFIX_ACTIVATION_ADMISSION", "lru"
+).lower()
+PREFIX_ACTIVATION_HISTORY = int(
+    os.environ.get("K3_PREFIX_ACTIVATION_HISTORY", "4096")
+)
 RESPONSE_MARKER = "<|open|>response<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
 
@@ -181,12 +187,17 @@ def _boot():
         )
     if PREFIX_ACTIVATION_ENABLED:
         _prefix_activations = PrefixActivationCache(
-            _chat_prefix_ids, PREFIX_ACTIVATION_ENTRIES
+            _chat_prefix_ids,
+            PREFIX_ACTIVATION_ENTRIES,
+            admission=PREFIX_ACTIVATION_ADMISSION,
+            history_entries=PREFIX_ACTIVATION_HISTORY,
         )
         print(
             f"[serve] shape-stable chat prefix activation enabled: "
             f"{len(_chat_prefix_ids)} fixed tokens, "
-            f"{PREFIX_ACTIVATION_ENTRIES} shape slot(s) (lazy build)",
+            f"{PREFIX_ACTIVATION_ENTRIES} shape slot(s), "
+            f"admission={PREFIX_ACTIVATION_ADMISSION}, "
+            f"history={PREFIX_ACTIVATION_HISTORY} (lazy build)",
             flush=True,
         )
     kr.check_expert_pool()
@@ -345,6 +356,7 @@ def _gen(
             f"shape={activation_plan['total_positions']}, "
             f"owned={snapshot['owned_bytes'] / 2**20:.1f} MiB, "
             f"skipped_edges={snapshot['skipped_route_edges']}, "
+            f"admitted={activation_plan['admitted']}, "
             f"resident_shapes="
             f"{activation_plan['resident_shapes_lru']}",
             flush=True,

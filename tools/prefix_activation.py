@@ -240,13 +240,27 @@ class PrefixActivationCache:
     shape that produced the retained activations.
     """
 
-    def __init__(self, prefix_token_ids, max_entries: int = 2):
+    def __init__(
+        self,
+        prefix_token_ids,
+        max_entries: int = 2,
+        admission: str = "lru",
+        history_entries: int = 4096,
+    ):
         self.prefix_token_ids = tuple(int(token) for token in prefix_token_ids)
         self.max_entries = int(max_entries)
+        self.admission = str(admission).lower()
+        self.history_entries = int(history_entries)
         if not self.prefix_token_ids:
             raise ValueError("prefix_token_ids must not be empty")
         if self.max_entries <= 0:
             raise ValueError("max_entries must be positive")
+        if self.admission not in ("lru", "repeat"):
+            raise ValueError(
+                f"unsupported prefix activation admission {admission!r}"
+            )
+        if self.history_entries <= 0:
+            raise ValueError("history_entries must be positive")
         self._sessions: OrderedDict[int, PrefixActivationSession] = (
             OrderedDict()
         )
@@ -255,6 +269,9 @@ class PrefixActivationCache:
         self.evictions = 0
         self.invalidations = 0
         self.capture_failures = 0
+        self.capture_completions = 0
+        self.bypasses = 0
+        self._observations: OrderedDict[int, int] = OrderedDict()
 
     def snapshot(self) -> dict[str, Any]:
         """Return compact cache ownership and LRU state for telemetry."""
@@ -268,6 +285,8 @@ class PrefixActivationCache:
         return {
             "entries": len(rows),
             "max_entries": self.max_entries,
+            "admission_policy": self.admission,
+            "history_entries": self.history_entries,
             "resident_shapes_lru": [
                 row["total_positions"] for row in rows
             ],
@@ -277,6 +296,9 @@ class PrefixActivationCache:
             "evictions": self.evictions,
             "invalidations": self.invalidations,
             "capture_failures": self.capture_failures,
+            "capture_completions": self.capture_completions,
+            "bypasses": self.bypasses,
+            "observed_shapes": len(self._observations),
         }
 
     def preview(self, mode: str, token_ids) -> dict[str, Any]:
@@ -312,6 +334,14 @@ class PrefixActivationCache:
         if not plan["eligible"]:
             return None, plan
         total = plan["total_positions"]
+        if self.admission == "repeat":
+            count = self._observations.pop(total, 0)
+            plan["seen_before"] = count > 0
+            self._observations[total] = count + 1
+            while len(self._observations) > self.history_entries:
+                self._observations.popitem(last=False)
+        else:
+            plan["seen_before"] = False
         session = self._sessions.pop(total, None)
         if session is None:
             session = PrefixActivationSession(
@@ -336,19 +366,31 @@ class PrefixActivationCache:
         if plan["action"] == "capture":
             activation = session.snapshot()
             session.arm_replay(expected_layers=expected_layers)
+            self.capture_completions += 1
             total = int(plan["total_positions"])
-            replaced = self._sessions.pop(total, None)
-            if replaced is not None and replaced is not session:
-                replaced.close()
-            self._sessions[total] = session
-            self.builds += 1
-            while len(self._sessions) > self.max_entries:
-                _shape, evicted = self._sessions.popitem(last=False)
-                evicted.close()
-                self.evictions += 1
+            admitted = (
+                self.admission == "lru"
+                or len(self._sessions) < self.max_entries
+                or plan["seen_before"]
+            )
+            plan["admitted"] = admitted
+            if admitted:
+                replaced = self._sessions.pop(total, None)
+                if replaced is not None and replaced is not session:
+                    replaced.close()
+                self._sessions[total] = session
+                self.builds += 1
+                while len(self._sessions) > self.max_entries:
+                    _shape, evicted = self._sessions.popitem(last=False)
+                    evicted.close()
+                    self.evictions += 1
+            else:
+                session.close()
+                self.bypasses += 1
         elif plan["action"] == "replay":
             session.finish_replay(expected_layers=expected_layers)
             activation = session.snapshot()
+            plan["admitted"] = None
         else:
             raise RuntimeError(f"invalid activation action {plan['action']}")
         after = self.snapshot()
@@ -382,3 +424,4 @@ class PrefixActivationCache:
         for session in self._sessions.values():
             session.close()
         self._sessions.clear()
+        self._observations.clear()

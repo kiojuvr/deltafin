@@ -122,6 +122,7 @@ class PrefixActivationTests(unittest.TestCase):
         complete_capture(5)
         self.assertEqual(cache.evictions, 1)
         self.assertEqual(cache.snapshot()["resident_shapes_lru"], [5])
+        self.assertEqual(cache.snapshot()["observed_shapes"], 0)
         _session, miss = cache.begin("chat", first)
         self.assertEqual(miss["action"], "capture")
 
@@ -163,6 +164,62 @@ class PrefixActivationTests(unittest.TestCase):
         cache.abort(session, plan)
         self.assertEqual(cache.capture_failures, 1)
         self.assertEqual(plan["cache_after"]["resident_shapes_lru"], [])
+
+    def test_repeat_admission_bypasses_one_off_scan_when_full(self):
+        cache = PrefixActivationCache(
+            [10], max_entries=2, admission="repeat"
+        )
+
+        def request(shape):
+            ids = [10] + list(range(shape - 1))
+            session, plan = cache.begin("chat", ids)
+            x = torch.zeros(shape, 2)
+            rows = [[1] for _ in range(shape)]
+            weights = [[0.5] for _ in range(shape)]
+            session.prepare(0, x, rows, weights)
+            session.finish(0, x)
+            cache.complete(session, plan, expected_layers=1)
+            return plan
+
+        plans = [
+            request(shape)
+            for shape in (2, 3, 2, 3, 4, 5, 6, 7, 2, 3)
+        ]
+        self.assertEqual(sum(plan["hit"] for plan in plans), 4)
+        self.assertEqual(cache.bypasses, 4)
+        self.assertEqual(cache.capture_completions, 6)
+        self.assertEqual(cache.builds, 2)
+        self.assertTrue(
+            all(plan["admitted"] is False for plan in plans[4:8])
+        )
+        self.assertTrue(
+            all(
+                plan["activation"]["owned_bytes"] == 16
+                for plan in plans[4:8]
+            )
+        )
+        self.assertEqual(cache.snapshot()["resident_shapes_lru"], [2, 3])
+        self.assertEqual(cache.snapshot()["admission_policy"], "repeat")
+
+    def test_invalid_admission_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            PrefixActivationCache([10], admission="unknown")
+        with self.assertRaisesRegex(ValueError, "history_entries"):
+            PrefixActivationCache([10], history_entries=0)
+
+    def test_repeat_observation_history_is_bounded_lru(self):
+        cache = PrefixActivationCache(
+            [10], max_entries=1, admission="repeat", history_entries=2
+        )
+        for shape in (2, 3, 4):
+            session, plan = cache.begin(
+                "chat", [10] + list(range(shape - 1))
+            )
+            cache.abort(session, plan)
+        self.assertEqual(cache.snapshot()["observed_shapes"], 2)
+        session, plan = cache.begin("chat", [10, 0])
+        self.assertFalse(plan["seen_before"])
+        cache.abort(session, plan)
 
 
 if __name__ == "__main__":

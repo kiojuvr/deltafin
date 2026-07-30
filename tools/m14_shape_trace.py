@@ -18,6 +18,7 @@ from m13_prefix_workload import (  # noqa: E402
     load_records,
     reuse_distances,
     simulate_lru,
+    simulate_repeat_admission,
 )
 from prefix_state import derive_chat_prefix  # noqa: E402
 from validate_m2_serial_token import model_tree_fingerprint  # noqa: E402
@@ -234,16 +235,22 @@ def analyze_shapes(
     )
     frequency = collections.Counter(shapes)
     sweep = {}
+    repeat_sweep = {}
     for capacity in range(1, max_capacity + 1):
         simulation = simulate_lru(shapes, capacity)
-        simulation["max_activation_bytes"] = (
+        repeat = simulate_repeat_admission(shapes, capacity)
+        maximum_bytes = (
             min(capacity, len(frequency)) * ACTIVATION_ENTRY_BYTES
         )
+        simulation["max_activation_bytes"] = maximum_bytes
+        repeat["max_activation_bytes"] = maximum_bytes
         if calibration is not None:
             simulation["projection"] = _project(
                 simulation, calibration
             )
+            repeat["projection"] = _project(repeat, calibration)
         sweep[str(capacity)] = simulation
+        repeat_sweep[str(capacity)] = repeat
     repeats = len(shapes) - len(frequency)
     finite_distances = [
         distance for distance in distances if distance is not None
@@ -278,6 +285,7 @@ def analyze_shapes(
             max(finite_distances) + 1 if finite_distances else None
         ),
         "capacity_sweep": sweep,
+        "repeat_admission_sweep": repeat_sweep,
     }
 
 

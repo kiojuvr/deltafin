@@ -70,6 +70,7 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
         )
     requests = hits + captures
     return {
+        "policy": "lru",
         "capacity": capacity,
         "requests": requests,
         "hits": hits,
@@ -77,6 +78,75 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
         "compulsory_misses": compulsory_misses,
         "eviction_misses": eviction_misses,
         "evictions": evictions,
+        "admissions": captures,
+        "bypasses": 0,
+        "hit_rate": hits / requests if requests else None,
+        "resident_shapes_lru": list(resident),
+        "trace": trace,
+    }
+
+
+def simulate_repeat_admission(
+    shapes: Iterable[int], capacity: int
+) -> dict[str, Any]:
+    """LRU with scan resistance: bypass first-seen misses once full."""
+    capacity = int(capacity)
+    if capacity <= 0:
+        raise ValueError("admission capacity must be positive")
+    resident: OrderedDict[int, None] = OrderedDict()
+    seen = set()
+    hits = captures = evictions = admissions = bypasses = 0
+    compulsory_misses = eviction_misses = 0
+    trace = []
+    for shape in (int(value) for value in shapes):
+        hit = shape in resident
+        if hit:
+            hits += 1
+            resident.move_to_end(shape)
+            action = "replay"
+            miss_class = None
+            admitted = None
+        else:
+            captures += 1
+            repeated = shape in seen
+            if repeated:
+                miss_class = "eviction"
+                eviction_misses += 1
+            else:
+                miss_class = "compulsory"
+                compulsory_misses += 1
+                seen.add(shape)
+            admitted = len(resident) < capacity or repeated
+            action = "capture"
+            if admitted:
+                admissions += 1
+                resident[shape] = None
+                if len(resident) > capacity:
+                    resident.popitem(last=False)
+                    evictions += 1
+            else:
+                bypasses += 1
+        trace.append(
+            {
+                "shape": shape,
+                "action": action,
+                "miss_class": miss_class,
+                "admitted": admitted,
+                "resident_shapes_lru": list(resident),
+            }
+        )
+    requests = hits + captures
+    return {
+        "policy": "repeat",
+        "capacity": capacity,
+        "requests": requests,
+        "hits": hits,
+        "captures": captures,
+        "compulsory_misses": compulsory_misses,
+        "eviction_misses": eviction_misses,
+        "evictions": evictions,
+        "admissions": admissions,
+        "bypasses": bypasses,
         "hit_rate": hits / requests if requests else None,
         "resident_shapes_lru": list(resident),
         "trace": trace,
