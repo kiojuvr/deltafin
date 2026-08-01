@@ -67,6 +67,24 @@ class M13PrefixWorkloadTests(unittest.TestCase):
         self.assertEqual(repeat["bypasses"], 4)
         self.assertEqual(repeat["resident_shapes_lru"], [89, 90])
 
+    def test_repeat_admission_history_matches_runtime_bound(self):
+        shapes = [89, 100, 100, 101, 102, 89]
+        bounded = simulate_repeat_admission(
+            shapes, capacity=1, history_entries=2
+        )
+        unbounded = simulate_repeat_admission(
+            shapes, capacity=1, history_entries=4
+        )
+        self.assertFalse(bounded["trace"][-1]["admitted"])
+        self.assertTrue(unbounded["trace"][-1]["admitted"])
+        self.assertEqual(bounded["observed_shapes"], 2)
+        self.assertEqual(bounded["history_forget_bypasses"], 1)
+        self.assertEqual(bounded["eviction_misses"], 2)
+
+    def test_repeat_admission_rejects_invalid_history_bound(self):
+        with self.assertRaisesRegex(ValueError, "history_entries"):
+            simulate_repeat_admission([89], capacity=1, history_entries=0)
+
     def test_summary_groups_shapes_and_io(self):
         rows = [
             record(89, "capture"),

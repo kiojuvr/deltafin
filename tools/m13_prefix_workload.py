@@ -87,18 +87,30 @@ def simulate_lru(shapes: Iterable[int], capacity: int) -> dict[str, Any]:
 
 
 def simulate_repeat_admission(
-    shapes: Iterable[int], capacity: int
+    shapes: Iterable[int],
+    capacity: int,
+    history_entries: int = 4096,
 ) -> dict[str, Any]:
     """LRU with scan resistance: bypass first-seen misses once full."""
     capacity = int(capacity)
+    history_entries = int(history_entries)
     if capacity <= 0:
         raise ValueError("admission capacity must be positive")
+    if history_entries <= 0:
+        raise ValueError("admission history_entries must be positive")
     resident: OrderedDict[int, None] = OrderedDict()
-    seen = set()
+    observations: OrderedDict[int, int] = OrderedDict()
+    ever_seen = set()
     hits = captures = evictions = admissions = bypasses = 0
+    history_forget_bypasses = 0
     compulsory_misses = eviction_misses = 0
     trace = []
     for shape in (int(value) for value in shapes):
+        observation_count = observations.pop(shape, 0)
+        seen_before = observation_count > 0
+        observations[shape] = observation_count + 1
+        while len(observations) > history_entries:
+            observations.popitem(last=False)
         hit = shape in resident
         if hit:
             hits += 1
@@ -108,15 +120,15 @@ def simulate_repeat_admission(
             admitted = None
         else:
             captures += 1
-            repeated = shape in seen
-            if repeated:
+            globally_repeated = shape in ever_seen
+            if globally_repeated:
                 miss_class = "eviction"
                 eviction_misses += 1
             else:
                 miss_class = "compulsory"
                 compulsory_misses += 1
-                seen.add(shape)
-            admitted = len(resident) < capacity or repeated
+                ever_seen.add(shape)
+            admitted = len(resident) < capacity or seen_before
             action = "capture"
             if admitted:
                 admissions += 1
@@ -126,12 +138,15 @@ def simulate_repeat_admission(
                     evictions += 1
             else:
                 bypasses += 1
+                if globally_repeated and not seen_before:
+                    history_forget_bypasses += 1
         trace.append(
             {
                 "shape": shape,
                 "action": action,
                 "miss_class": miss_class,
                 "admitted": admitted,
+                "seen_before": seen_before,
                 "resident_shapes_lru": list(resident),
             }
         )
@@ -139,6 +154,8 @@ def simulate_repeat_admission(
     return {
         "policy": "repeat",
         "capacity": capacity,
+        "history_entries": history_entries,
+        "observed_shapes": len(observations),
         "requests": requests,
         "hits": hits,
         "captures": captures,
@@ -147,6 +164,7 @@ def simulate_repeat_admission(
         "evictions": evictions,
         "admissions": admissions,
         "bypasses": bypasses,
+        "history_forget_bypasses": history_forget_bypasses,
         "hit_rate": hits / requests if requests else None,
         "resident_shapes_lru": list(resident),
         "trace": trace,

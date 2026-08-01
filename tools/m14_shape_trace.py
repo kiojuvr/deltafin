@@ -220,6 +220,7 @@ def analyze_shapes(
     trace: list[dict[str, Any]],
     *,
     max_capacity: int,
+    repeat_history_entries: int = 4096,
     calibration: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     memo_requests = sum(bool(row.get("memo_hit")) for row in trace)
@@ -238,7 +239,11 @@ def analyze_shapes(
     repeat_sweep = {}
     for capacity in range(1, max_capacity + 1):
         simulation = simulate_lru(shapes, capacity)
-        repeat = simulate_repeat_admission(shapes, capacity)
+        repeat = simulate_repeat_admission(
+            shapes,
+            capacity,
+            history_entries=repeat_history_entries,
+        )
         maximum_bytes = (
             min(capacity, len(frequency)) * ACTIVATION_ENTRY_BYTES
         )
@@ -278,6 +283,7 @@ def analyze_shapes(
         ),
         "compulsory_misses": len(frequency),
         "repeat_requests": repeats,
+        "repeat_admission_history_entries": repeat_history_entries,
         "infinite_capacity_hit_rate": (
             repeats / len(shapes) if shapes else None
         ),
@@ -305,6 +311,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-capacity", type=int, default=16)
     parser.add_argument(
+        "--repeat-history-entries",
+        type=int,
+        default=4096,
+        help="bounded shape observation history used by repeat admission",
+    )
+    parser.add_argument(
         "--calibration-jsonl",
         type=pathlib.Path,
         help="optional M13 server metrics for coarse cost projection",
@@ -321,6 +333,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.max_capacity <= 0:
         raise ValueError("--max-capacity must be positive")
+    if args.repeat_history_entries <= 0:
+        raise ValueError("--repeat-history-entries must be positive")
     sources = sum(
         (bool(args.stress), bool(args.request_jsonl), bool(args.shape_jsonl))
     )
@@ -361,6 +375,7 @@ def main(argv=None) -> int:
     analysis = analyze_shapes(
         trace,
         max_capacity=args.max_capacity,
+        repeat_history_entries=args.repeat_history_entries,
         calibration=calibration,
     )
     prefix_lengths = {

@@ -53,6 +53,7 @@ class M14ShapeTraceTests(unittest.TestCase):
             report["capacity_sweep"]["2"]["eviction_misses"], 1
         )
         self.assertIn("2", report["repeat_admission_sweep"])
+        self.assertEqual(report["repeat_admission_history_entries"], 4096)
         self.assertEqual(report["capacity_for_all_observed_reuse"], 3)
 
     def test_calibration_and_projection_are_explicitly_coarse(self):
