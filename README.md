@@ -62,6 +62,7 @@ The core inference engine is complete.
 | Request-level I/O and cache telemetry      | Complete          |
 | Privacy-minimized prompt-shape tracing     | Complete          |
 | Scan-resistant admission experiment        | Complete          |
+| Passive admission selection gate           | Complete          |
 | Exact output contract                      | Bitwise validated |
 
 The selected M3 Ultra profile remains conservative:
@@ -72,7 +73,7 @@ The selected M3 Ultra profile remains conservative:
 * serial expert delivery;
 * adaptive expert prefetch disabled;
 * two-entry exact-shape prefix activation LRU;
-* standard LRU admission selected until representative passive traffic proves otherwise.
+* standard LRU admission retained by the M16 passive-evidence gate.
 
 ## Headline results
 
@@ -586,9 +587,12 @@ In a 42-request scan-heavy synthetic trace with capacity two:
 | LRU              |    4 |
 | Repeat admission |    7 |
 
-Repeat admission remains experimental until representative passive server traffic demonstrates an advantage. Standard LRU is still selected.
+The M16 passive trace contained one eligible request and no exact-shape reuse,
+so it could not justify a controlled server A/B or a policy change. Repeat
+admission remains experimental and standard LRU is still selected.
 
 See [M15: repeat-aware admission](docs/m3ultra512-m15-repeat-admission.md).
+See [M16: passive admission gate](docs/m3ultra512-m16-admission-gate.md).
 
 ## Telemetry
 
@@ -646,7 +650,7 @@ Analyze a trace with:
 
 ```bash
 .venv/bin/python tools/m14_shape_trace.py \
-  --input bench-results/m14-server-shapes.jsonl \
+  --shape-jsonl bench-results/m14-server-shapes.jsonl \
   --max-capacity 16
 ```
 
@@ -690,7 +694,8 @@ Status: experimental only, default off.
 
 A scan-heavy 42-request trace contained 32 exact prompt shapes. Capacity three improved over capacity two, but capacities four through fourteen added memory without additional hits.
 
-Status: capacity two retained pending passive real-traffic evidence.
+Status: capacity two retained. M16's available passive trace had no reuse and
+therefore did not authorize a controlled policy A/B.
 
 ## Validation history
 
@@ -713,6 +718,7 @@ Status: capacity two retained pending passive real-traffic evidence.
 | M13       | OpenAI server capture/replay telemetry                                  | [Server workload](docs/m3ultra512-m13-server-workload.md)     |
 | M14       | Privacy-minimized passive shape tracing                                 | [Shape trace](docs/m3ultra512-m14-shape-trace.md)             |
 | M15       | Scan-resistant repeat admission                                         | [Repeat admission](docs/m3ultra512-m15-repeat-admission.md)   |
+| M16       | Passive evidence gate retained exact LRU                                 | [Admission gate](docs/m3ultra512-m16-admission-gate.md)       |
 
 ## Current limitations
 
